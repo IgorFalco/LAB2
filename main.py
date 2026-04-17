@@ -245,9 +245,10 @@ def reconstruct_visits(
     arrivals = flights[flights["movement_type"] == "chegada"].copy()
     departures = flights[flights["movement_type"] == "partida"].copy()
 
-    departures_by_key: Dict[Tuple[pd.Timestamp, str, str], List[dict]] = {}
+    # Chave sem date para suportar emparelhamentos que cruzam a meia-noite
+    departures_by_key: Dict[Tuple[str, str], List[dict]] = {}
     for _, row in departures.iterrows():
-        key = (row["date"], row["company"], row["aircraft_code"])
+        key = (row["company"], row["aircraft_code"])
         departures_by_key.setdefault(key, []).append(row.to_dict())
 
     for key in departures_by_key:
@@ -257,7 +258,7 @@ def reconstruct_visits(
     used_departures: set[str] = set()
 
     for _, arr in arrivals.sort_values("datetime").iterrows():
-        key = (arr["date"], arr["company"], arr["aircraft_code"])
+        key = (arr["company"], arr["aircraft_code"])
         candidates = departures_by_key.get(key, [])
 
         chosen_dep = None
@@ -598,11 +599,23 @@ def build_model(problem: ProblemData, config: ModelConfig) -> Tuple[gp.Model, gp
     # 4) Definição do reboque
     for op_id in tow_candidates:
         successor_id = operations.loc[op_id, "successor_operation_id"]
-        common_stands = set(problem.compatible_stands[op_id]).intersection(problem.compatible_stands[successor_id])
+        compatible_op = set(problem.compatible_stands[op_id])
+        compatible_succ = set(problem.compatible_stands[successor_id])
+
+        common_stands = compatible_op.intersection(compatible_succ)
+        only_op_stands = compatible_op - compatible_succ
+
         for stand_id in common_stands:
             model.addConstr(
                 x[op_id, stand_id] - x[successor_id, stand_id] <= y[op_id],
                 name=f"tow_def_{op_id}_{stand_id}",
+            )
+
+        # Posições compatíveis com op_id mas não com a sucessora exigem reboque obrigatoriamente
+        for stand_id in only_op_stands:
+            model.addConstr(
+                x[op_id, stand_id] <= y[op_id],
+                name=f"tow_force_{op_id}_{stand_id}",
             )
 
     set_objective(model, x, y, problem, config)
