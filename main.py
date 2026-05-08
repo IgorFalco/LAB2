@@ -19,7 +19,7 @@ class ModelConfig:
     """Parâmetros principais do modelo e do pré-processamento."""
 
     # Emparelhamento chegada-partida para reconstruir visitas
-    min_turnaround_minutes: int = 30
+    min_turnaround_minutes: int = 40
     max_turnaround_minutes: int = 8 * 60
 
     # Regra para permitir reboque / divisão em 3 operações
@@ -56,6 +56,9 @@ class ModelConfig:
 
     # Mantido para compatibilidade; agora também geramos adjacência automática
     overlapping_stands: Dict[str, List[str]] = field(default_factory=dict)
+
+    # Restrição física (Confins): aeronaves categoria D/E só podem usar estes stands
+    de_allowed_stands: Tuple[str, ...] = ("117", "120", "123", "126")
 
 
 # ============================================================
@@ -146,12 +149,12 @@ def parse_allowed_categories(raw_value: str) -> set[str]:
     Regras do CSV de posições:
     - A pode parar em qualquer posição
     - C  -> posição aceita A e C
-    - DE -> posição aceita somente D e E
+    - DE -> posição aceita D e E (e A, por ser menor)
     """
     value = str(raw_value).strip().upper()
 
     if value == "DE":
-        return {"D", "E"}
+        return {"A", "D", "E"}
 
     if value == "C":
         return {"A", "C"}
@@ -173,8 +176,12 @@ def normalize_positions(positions: pd.DataFrame, config: ModelConfig) -> pd.Data
     df = positions.copy()
     df.columns = [c.strip() for c in df.columns]
 
-    df["stand_id"] = df["Posicao"].astype(str).str.strip()
     df["stand_number"] = pd.to_numeric(df["Posicao"], errors="coerce")
+    df["stand_id"] = df["Posicao"].astype(str).str.strip()
+    # Evita IDs como "117.0" quando o CSV foi lido como float.
+    stand_rounded = df["stand_number"].round(0)
+    integer_like = df["stand_number"].notna() & (df["stand_number"] == stand_rounded)
+    df.loc[integer_like, "stand_id"] = stand_rounded.loc[integer_like].astype(int).astype(str)
     df["stand_type"] = df["Tipo"].apply(normalize_stand_type)
     df["patio"] = pd.to_numeric(df["Patio"], errors="coerce").fillna(0).astype(int)
     df["aircraft_category"] = df["Aeronave"].astype(str).str.strip().str.upper()
@@ -389,14 +396,20 @@ def build_operations(visits: pd.DataFrame, config: ModelConfig) -> pd.DataFrame:
 
 def is_category_compatible(operation_category: str, allowed_categories: set[str]) -> bool:
     op_cat = str(operation_category).strip().upper()
+    # Categoria A (menor) pode usar qualquer posição.
+    if op_cat == "A":
+        return True
     return op_cat in allowed_categories
 
 
 def build_compatible_stands(
     operations: pd.DataFrame,
     positions: pd.DataFrame,
+    config: ModelConfig,
 ) -> Dict[str, List[str]]:
     compatible: Dict[str, List[str]] = {}
+
+    de_allowed = {str(s).strip() for s in (config.de_allowed_stands or ())}
 
     for _, op in operations.iterrows():
         op_id = op["operation_id"]
@@ -409,6 +422,10 @@ def build_compatible_stands(
             allowed_categories = stand["allowed_categories"]
             stand_is_parking_only = bool(stand["is_parking_only"])
 
+            # D/E só podem usar stands específicos.
+            if op_cat in {"D", "E"} and de_allowed and stand_id not in de_allowed:
+                continue
+
             if not is_category_compatible(op_cat, allowed_categories):
                 continue
             if not allow_parking_only and stand_is_parking_only:
@@ -417,6 +434,11 @@ def build_compatible_stands(
             candidates.append(stand_id)
 
         if not candidates:
+            if op_cat in {"D", "E"} and de_allowed:
+                raise ValueError(
+                    f"A operação {op_id} (categoria {op_cat}) não possui nenhuma posição compatível. "
+                    f"Stands permitidos para D/E: {sorted(de_allowed)}"
+                )
             raise ValueError(f"A operação {op_id} não possui nenhuma posição compatível.")
 
         compatible[op_id] = candidates
@@ -492,7 +514,7 @@ def prepare_problem_data(
     aircraft_category_map = build_aircraft_category_map(aircraft_categories_raw, config)
     visits = reconstruct_visits(flights, aircraft_category_map, config)
     operations = build_operations(visits, config)
-    compatible_stands = build_compatible_stands(operations, positions)
+    compatible_stands = build_compatible_stands(operations, positions, config)
     overlapping_ops = build_overlapping_operations(operations, config.turnaround_buffer_minutes)
 
     auto_adjacent_stands = build_adjacent_stands(positions)
