@@ -60,6 +60,13 @@ class ModelConfig:
     # Restrição física (Confins): aeronaves categoria D/E só podem usar estes stands
     de_allowed_stands: Tuple[str, ...] = ("117", "120", "123", "126")
 
+    # Regra operacional: portões 107–115 são exclusivos para a Azul
+    azul_only_stands: Tuple[str, ...] = tuple(str(i) for i in range(107, 116))
+
+    # Empresas que podem usar os portões exclusivos (case-insensitive).
+    # Ex.: inclui "Azul Conecta" por fazer parte da operação Azul.
+    azul_only_companies: Tuple[str, ...] = ("Azul", "Azul Conecta")
+
 
 # ============================================================
 # Leitura e preparação dos dados
@@ -410,17 +417,26 @@ def build_compatible_stands(
     compatible: Dict[str, List[str]] = {}
 
     de_allowed = {str(s).strip() for s in (config.de_allowed_stands or ())}
+    azul_only_company_keys = {
+        " ".join(str(c).split()).casefold() for c in (config.azul_only_companies or ())
+    }
 
     for _, op in operations.iterrows():
         op_id = op["operation_id"]
         op_cat = str(op["aircraft_category"]).strip().upper()
         allow_parking_only = bool(op["allow_parking_only"])
+        company = str(op.get("company", "")).strip()
+        company_key = " ".join(company.split()).casefold()
 
         candidates: List[str] = []
         for _, stand in positions.iterrows():
             stand_id = stand["stand_id"]
             allowed_categories = stand["allowed_categories"]
             stand_is_parking_only = bool(stand["is_parking_only"])
+
+            # Portões 107–115 exclusivos para voos da Azul.
+            if stand_id in (config.azul_only_stands or ()) and company_key not in azul_only_company_keys:
+                continue
 
             # D/E só podem usar stands específicos.
             if op_cat in {"D", "E"} and de_allowed and stand_id not in de_allowed:
@@ -724,6 +740,7 @@ def extract_solution(
                     "operation_id": op_id,
                     "visit_id": operations.loc[op_id, "visit_id"],
                     "operation_type": operations.loc[op_id, "operation_type"],
+                    "company": operations.loc[op_id, "company"],
                     "aircraft_category": operations.loc[op_id, "aircraft_category"],
                     "start_time": operations.loc[op_id, "start_time"],
                     "end_time": operations.loc[op_id, "end_time"],
@@ -731,6 +748,7 @@ def extract_solution(
                     "stand_id": stand_id,
                     "stand_type": positions.loc[stand_id, "stand_type"],
                     "walking_distance": positions.loc[stand_id, "walking_distance"],
+                    "revenue_factor": positions.loc[stand_id, "revenue_factor"],
                     "is_contact": positions.loc[stand_id, "is_contact"],
                 }
             )

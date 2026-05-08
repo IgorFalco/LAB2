@@ -25,22 +25,26 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # ── Paletas ─────────────────────────────────────────────────────────────────
 
-TYPE_COLOR = {
-    "turnaround": "#4C9BE8",
-    "arrival":    "#2ECC71",
-    "parking":    "#95A5A6",
-    "departure":  "#E5FF00",
-    "Azul":       "#1E00FF",
-    "Latam":      "#FF0000",
-    "Gol":        "#FFA600",
+OPERATION_COLOR = {
+    "turnaround": "#0B3D91",  # azul escuro (alto contraste)
+    "arrival": "#0B6E4F",     # verde escuro
+    "parking": "#374151",     # cinza escuro
+    "departure": "#B45309",   # âmbar escuro
+}
 
+COMPANY_COLOR = {
+    # Cores mais leves (pastel) para o preenchimento.
+    "Azul": "#BFD3FF",
+    "Azul Conecta": "#BFD3FF",
+    "Gol": "#FFD7A8",
+    "Latam": "#FFB3B3",
 }
 
 OPERATION_LABELS = {
-    "turnaround": "Chegada → Partida",
-    "arrival": "Chegada",
-    "parking": "Estacionado",
-    "departure": "Partida",
+    "turnaround": "Turnaround",
+    "arrival": "Arrival",
+    "parking": "Parking",
+    "departure": "Departure",
 }
 
 STAND_COLOR = {
@@ -71,6 +75,17 @@ def format_duration_minutes(minutes: float) -> str:
     return f"{hours} h {mins} min"
 
 
+def format_int_pt(value) -> str:
+    """Formata inteiro com separador de milhar em PT-BR (ponto)."""
+    if value is None or pd.isna(value):
+        return ""
+    try:
+        number = int(round(float(value)))
+    except Exception:
+        return str(value)
+    return f"{number:,}".replace(",", ".")
+
+
 _STAND_ID_INT_RE = re.compile(r"^(\d+)(?:\.0+)?$")
 
 
@@ -95,6 +110,20 @@ def stand_sort_key(value: str):
         return int(str(value))
     except Exception:
         return str(value)
+
+
+def normalize_company(value: str) -> str:
+    text = str(value).strip()
+    key = text.casefold()
+    if key == "azul":
+        return "Azul"
+    if key == "azul conecta":
+        return "Azul Conecta"
+    if key == "gol":
+        return "Gol"
+    if key == "latam":
+        return "Latam"
+    return text
 
 # ── Tabs principais ─────────────────────────────────────────────────────────
 
@@ -156,7 +185,7 @@ with tab_config:
     with st.expander("Parâmetros avançados"):
         col_a1, col_a2, col_a3 = st.columns(3)
         min_turn = col_a1.number_input(
-            "Turnaround mínimo (min)", min_value=5,  max_value=120, value=30)
+            "Turnaround mínimo (min)", min_value=40, max_value=120, value=40)
         max_turn = col_a2.number_input(
             "Turnaround máximo (min)", min_value=60, max_value=720, value=480)
         tow_thr = col_a3.number_input(
@@ -249,7 +278,7 @@ with tab_config:
 
                 st.success(
                     f"✅ Otimização concluída! Status: **{result.status}** · "
-                    f"Objetivo: **{result.objective_value:,.0f}** · "
+                    f"Objetivo: **{format_int_pt(result.objective_value)}** · "
                     f"Vá para a aba **Resultados**."
                 )
 
@@ -304,6 +333,10 @@ with tab_results:
     if "pax" in alloc.columns:
         alloc["pax"] = pd.to_numeric(
             alloc["pax"], errors="coerce").fillna(0).astype(int)
+    if "company" in alloc.columns:
+        alloc["company"] = alloc["company"].astype(str).map(normalize_company)
+    else:
+        alloc["company"] = ""
     if "aircraft_category" in alloc.columns:
         alloc["aircraft_category"] = alloc["aircraft_category"].astype(str)
     if "visit_id" in alloc.columns:
@@ -311,24 +344,156 @@ with tab_results:
     if not tows.empty and "operation_id" in tows.columns:
         tows["operation_id"] = tows["operation_id"].astype(str)
 
-    # ── KPIs ────────────────────────────────────────────────────────────────
+    # ── Seleção de dia (afeta KPIs, Gantt e lista do dia) ──────────────────
 
-    pax_contato = alloc[alloc["is_contact"] == 1]["pax"].sum()
-    pax_total = alloc["pax"].sum()
-    pct_contato = pax_contato / pax_total * 100 if pax_total > 0 else 0
+    all_dates = sorted(alloc["start_time"].dt.date.unique())
+    if not all_dates:
+        st.warning("Nenhuma data encontrada nos resultados.")
+        st.stop()
 
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Operações alocadas",  f"{len(alloc):,}")
-    k2.metric("Posições utilizadas", alloc["stand_id"].nunique())
-    k3.metric("Reboques",            f"{len(tows):,}")
-    k4.metric("PAX em contato",      f"{pct_contato:.1f}%")
-    k5.metric("Longa permanência",
-              alloc[alloc["operation_type"] == "parking"]["visit_id"].nunique())
+    selected_date = st.selectbox(
+        "Data",
+        all_dates,
+        key="selected_date",
+    )
 
-    if "obj_value" in st.session_state:
-        obj_label = OBJECTIVE_LABELS.get(
-            st.session_state.get("objective", ""), "Objetivo")
-        st.caption(f"**{obj_label}:** {st.session_state['obj_value']:,.0f}")
+    alloc_day = alloc[alloc["start_time"].dt.date == selected_date].copy()
+
+    if tows.empty:
+        tows_day = tows.copy()
+    else:
+        tows_with_time = tows.merge(
+            alloc[["operation_id", "start_time"]],
+            on="operation_id",
+            how="left",
+        )
+        tows_day = (
+            tows_with_time[tows_with_time["start_time"].dt.date == selected_date]
+            .drop(columns=["start_time"], errors="ignore")
+            .reset_index(drop=True)
+        )
+
+    # ── KPIs + métricas (dia selecionado) ─────────────────────────────────
+
+    if "revenue_factor" in alloc.columns:
+        alloc["revenue_factor"] = pd.to_numeric(
+            alloc["revenue_factor"], errors="coerce"
+        ).fillna(0.0)
+    else:
+        # Compatibilidade com resultados antigos: reconstroi o fator de receita via tipo da posição.
+        base_cfg = ModelConfig()
+        stand_type_to_factor = {
+            "contato": float(base_cfg.contact_revenue_factor),
+            "remoto": float(base_cfg.remote_revenue_factor),
+            "estacionamento": float(base_cfg.parking_revenue_factor),
+        }
+        alloc["revenue_factor"] = (
+            alloc["stand_type"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .map(stand_type_to_factor)
+            .fillna(0.0)
+        )
+
+    # Mantém o mesmo revenue_factor também na fatia do dia.
+    if "revenue_factor" not in alloc_day.columns:
+        alloc_day = alloc_day.merge(
+            alloc[["operation_id", "revenue_factor"]],
+            on="operation_id",
+            how="left",
+        )
+
+    def compute_scope_metrics(scope_alloc: pd.DataFrame, scope_tows: pd.DataFrame) -> dict:
+        if scope_alloc.empty:
+            return {
+                "ops": 0,
+                "stands": 0,
+                "tows": int(len(scope_tows)),
+                "pax_contato": 0,
+                "pax_total": 0,
+                "pct_contato": 0.0,
+                "walking_total": 0.0,
+                "revenue_total": 0.0,
+                "parking_minutes_total": 0.0,
+            }
+
+        pax_contato = int(scope_alloc[scope_alloc["is_contact"] == 1]["pax"].sum())
+        pax_total = int(scope_alloc["pax"].sum())
+        pct_contato = pax_contato / pax_total * 100 if pax_total > 0 else 0.0
+        walking_total = float((scope_alloc["pax"] * scope_alloc["walking_distance"]).sum())
+        revenue_total = float((scope_alloc["pax"] * scope_alloc["revenue_factor"]).sum())
+
+        parking_ops = scope_alloc[scope_alloc["operation_type"] == "parking"]
+        parking_minutes_total = float(
+            ((parking_ops["end_time"] - parking_ops["start_time"]).dt.total_seconds() / 60.0).sum()
+        )
+
+        return {
+            "ops": int(len(scope_alloc)),
+            "stands": int(scope_alloc["stand_id"].nunique()),
+            "tows": int(len(scope_tows)),
+            "pax_contato": pax_contato,
+            "pax_total": pax_total,
+            "pct_contato": float(pct_contato),
+            "walking_total": walking_total,
+            "revenue_total": revenue_total,
+            "parking_minutes_total": parking_minutes_total,
+        }
+
+    daily = compute_scope_metrics(alloc_day, tows_day)
+
+    st.subheader("KPIs")
+    st.caption(f"Data: {selected_date.strftime('%d/%m/%Y')}")
+    d1, d2, d3, d4, d5 = st.columns(5)
+    d1.metric("Operações alocadas", format_int_pt(daily["ops"]))
+    d2.metric("Posições utilizadas", format_int_pt(daily["stands"]))
+    d3.metric("Reboques", format_int_pt(daily["tows"]))
+    d4.metric("PAX em contato", f"{daily['pct_contato']:.1f}%")
+    d5.metric("Longa permanência (min)", format_int_pt(daily["parking_minutes_total"]))
+
+    objective_key = st.session_state.get("objective")
+    if objective_key:
+        obj_label = OBJECTIVE_LABELS.get(objective_key, "Objetivo")
+        obj_value_day = {
+            "walking_distance": daily["walking_total"],
+            "contact_share": daily["pax_contato"],
+            "tow_count": daily["tows"],
+            "revenue": daily["revenue_total"],
+        }.get(objective_key)
+        if obj_value_day is not None:
+            st.caption(f"**{obj_label} (dia):** {format_int_pt(obj_value_day)}")
+
+    def build_objective_table(scope: dict) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "Função objetivo": OBJECTIVE_LABELS["walking_distance"],
+                    "Sentido": "min",
+                    "Valor": int(round(scope["walking_total"])),
+                },
+                {
+                    "Função objetivo": OBJECTIVE_LABELS["contact_share"],
+                    "Sentido": "max",
+                    "Valor": int(scope["pax_contato"]),
+                },
+                {
+                    "Função objetivo": OBJECTIVE_LABELS["tow_count"],
+                    "Sentido": "min",
+                    "Valor": int(scope["tows"]),
+                },
+                {
+                    "Função objetivo": OBJECTIVE_LABELS["revenue"],
+                    "Sentido": "max",
+                    "Valor": int(round(scope["revenue_total"])),
+                },
+            ]
+        )
+
+    st.markdown("**Funções objetivo**")
+    objective_table = build_objective_table(daily)
+    objective_table["Valor"] = objective_table["Valor"].map(format_int_pt)
+    st.dataframe(objective_table, use_container_width=True, hide_index=True)
 
     st.divider()
 
@@ -336,16 +501,14 @@ with tab_results:
 
     st.subheader("Gráfico de Gantt – Alocação por Posição")
 
-    c1, c2, c3 = st.columns([2, 2, 2])
+    c1, c2 = st.columns([2, 2])
 
-    all_dates = sorted(alloc["start_time"].dt.date.unique())
-    selected_date = c1.selectbox("Data", all_dates)
     stand_types = ["Todos"] + sorted(alloc["stand_type"].unique())
-    sel_stand_type = c2.selectbox("Tipo de posição", stand_types)
+    sel_stand_type = c1.selectbox("Tipo de posição", stand_types)
     op_types = ["Todos"] + sorted(alloc["operation_type"].unique())
-    sel_op_type = c3.selectbox("Tipo de operação", op_types)
+    sel_op_type = c2.selectbox("Tipo de operação", op_types)
 
-    df = alloc[alloc["start_time"].dt.date == selected_date].copy()
+    df = alloc_day.copy()
     if sel_stand_type != "Todos":
         df = df[df["stand_type"] == sel_stand_type]
     if sel_op_type != "Todos":
@@ -358,6 +521,7 @@ with tab_results:
         min_value=0, max_value=23,
         value=(min_h, min(max_h, min_h + 4)),
         step=1,
+        key=f"hour_window_{selected_date.isoformat()}",
     )
     df = df[
         (df["start_time"].dt.hour < h_end + 1) &
@@ -385,21 +549,36 @@ with tab_results:
         df["ground_duration"] = df["ground_duration_min"].apply(
             format_duration_minutes)
 
-        type_color_labels = {OPERATION_LABELS.get(
-            k, k): v for k, v in TYPE_COLOR.items()}
-
         stand_order = sorted(
             df["stand_id"].unique().tolist(), key=stand_sort_key)
 
+        # Se o resultado não traz empresa (ex.: CSV antigo), evita gráfico "monocromático".
+        has_company = df["company"].astype(str).str.strip().ne("").any()
+        if has_company:
+            color_col = "company"
+            color_map = COMPANY_COLOR
+            legend_title = "Empresa"
+        else:
+            st.warning(
+                "Este resultado não contém a coluna de empresa (provavelmente um CSV antigo). "
+                "Execute a otimização novamente para ver as cores por empresa."
+            )
+            color_col = "operation_label"
+            color_map = {OPERATION_LABELS.get(k, k): v for k, v in OPERATION_COLOR.items()}
+            legend_title = "Etapa"
+
+        # Cor de preenchimento = empresa; cor da borda = tipo de operação.
+        # (O tipo de operação também aparece no tooltip.)
         fig_gantt = px.timeline(
             df,
             x_start="start_time", x_end="end_time",
             y="stand_id",
-            color="operation_label",
-            color_discrete_map=type_color_labels,
+            color=color_col,
+            color_discrete_map=color_map,
             category_orders={"stand_id": stand_order},
             hover_data={
                 "visit_id": True,
+                "company": True,
                 "operation_label": True,
                 "aircraft_category": True,
                 "pax": True,
@@ -416,6 +595,7 @@ with tab_results:
                 "ground_duration_min": False,
             },
             labels={
+                "company": "Empresa",
                 "operation_label": "Etapa",
                 "stand_id": "Posição",
                 "stand_type": "Tipo de posição",
@@ -433,19 +613,30 @@ with tab_results:
         fig_gantt.update_layout(
             xaxis_title="Horário",
             yaxis_title="Posição",
-            legend_title="Etapa",
+            legend_title=legend_title,
             margin=dict(l=60, r=20, t=20, b=40),
         )
         fig_gantt.update_xaxes(tickformat="%H:%M")
         fig_gantt.update_yaxes(type="category")
-        fig_gantt.update_traces(marker_line_width=0.5)
+
+        # Aplica a cor de borda por tipo de operação.
+        df["_op_border_color"] = (
+            df["operation_type"].astype(str).str.strip().str.lower().map(OPERATION_COLOR).fillna("#000000")
+        )
+        for trace in fig_gantt.data:
+            trace_name = str(getattr(trace, "name", ""))
+            mask = df[color_col].astype(str) == trace_name
+            border_colors = df.loc[mask, "_op_border_color"].tolist()
+            if border_colors:
+                trace.marker.line.color = border_colors
+                trace.marker.line.width = 3
         st.plotly_chart(fig_gantt, use_container_width=True)
 
     # ── Lista de voos por portão (dia) ─────────────────────────────────────
 
-    st.subheader("Lista de voos por portão (dia selecionado)")
+    st.subheader("Lista de voos por portão")
 
-    day_df = alloc[alloc["start_time"].dt.date == selected_date].copy()
+    day_df = alloc_day.copy()
     if day_df.empty:
         st.info("Nenhuma operação alocada para este dia.")
     else:
@@ -461,7 +652,10 @@ with tab_results:
         stands_day = sorted(
             day_df["stand_id"].unique().tolist(), key=stand_sort_key)
         selected_stand = st.selectbox(
-            "Portão", options=["Todos"] + stands_day, key="list_portao")
+            "Portão",
+            options=["Todos"] + stands_day,
+            key=f"list_portao_{selected_date.isoformat()}",
+        )
 
         if selected_stand != "Todos":
             day_df = day_df[day_df["stand_id"] == selected_stand]
@@ -472,6 +666,7 @@ with tab_results:
             "inicio",
             "fim",
             "op_duration",
+            "company",
             "aircraft_category",
             "pax",
             "stand_type",
@@ -488,6 +683,7 @@ with tab_results:
                     "inicio": "Início",
                     "fim": "Fim",
                     "op_duration": "Duração",
+                    "company": "Empresa",
                     "aircraft_category": "Categoria",
                     "pax": "PAX",
                     "stand_type": "Tipo de posição",
@@ -510,7 +706,7 @@ with tab_results:
     with col_a:
         st.markdown("**Operações por tipo de posição**")
         fig = px.pie(
-            alloc["stand_type"].value_counts().reset_index().rename(
+            alloc_day["stand_type"].value_counts().reset_index().rename(
                 columns={"stand_type": "Tipo", "count": "Qtd"}),
             values="Qtd", names="Tipo",
             color="Tipo", color_discrete_map=STAND_COLOR, hole=0.4,
@@ -522,7 +718,7 @@ with tab_results:
     with col_b:
         st.markdown("**Operações por categoria de aeronave**")
         fig = px.bar(
-            alloc["aircraft_category"].value_counts().reset_index().rename(
+            alloc_day["aircraft_category"].value_counts().reset_index().rename(
                 columns={"aircraft_category": "Categoria", "count": "Qtd"}),
             x="Categoria", y="Qtd",
             color="Categoria",
@@ -536,7 +732,7 @@ with tab_results:
 
     with col_c:
         st.markdown("**Estacionamento de longa permanência por tipo**")
-        park = alloc[alloc["operation_type"] == "parking"]
+        park = alloc_day[alloc_day["operation_type"] == "parking"]
         fig = px.bar(
             park["stand_type"].value_counts().reset_index().rename(
                 columns={"stand_type": "Tipo", "count": "Qtd"}),
@@ -555,7 +751,7 @@ with tab_results:
     st.subheader("Utilização das posições")
 
     util = (
-        alloc.groupby(["stand_id", "stand_type"])
+        alloc_day.groupby(["stand_id", "stand_type"])
         .agg(operacoes=("operation_id", "count"), pax_total=("pax", "sum"))
         .reset_index()
         .sort_values("operacoes", ascending=False)
@@ -579,13 +775,13 @@ with tab_results:
 
     # ── Reboques ─────────────────────────────────────────────────────────────
 
-    st.subheader(f"Reboques identificados ({len(tows)})")
+    st.subheader(f"Reboques ({len(tows_day)})")
 
-    if tows.empty:
-        st.info("Nenhum reboque nesta solução.")
+    if tows_day.empty:
+        st.info("Nenhum reboque neste dia.")
     else:
         tows_detail = (
-            tows
+            tows_day
             .merge(
                 alloc[["operation_id", "stand_id",
                        "start_time", "aircraft_category"]],
