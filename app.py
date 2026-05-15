@@ -338,8 +338,15 @@ def choose_feasible_stand(
     adjacency: dict[str, list[str]],
     config: ModelConfig,
     buffer_minutes: int,
+    blocked_stands: list[str] | None = None,
 ) -> str | None:
     candidates = compatible_stands_for_operation(op_row, positions, config)
+    if not candidates:
+        return None
+
+    # Exclui portões bloqueados por manutenção
+    if blocked_stands:
+        candidates = [s for s in candidates if str(s) not in blocked_stands]
     if not candidates:
         return None
 
@@ -393,8 +400,10 @@ def apply_departure_delay_and_reassign(
     positions: pd.DataFrame,
     adjacency: dict[str, list[str]],
     config: ModelConfig,
+    blocked_stands: list[str] | None = None,
 ) -> dict:
-    """Aplica atraso na partida (em minutos) e realoca operações que entrarem em conflito."""
+    """Aplica atraso na partida (em minutos) e realoca operações que entrarem em conflito.
+    Portões listados em `blocked_stands` são tratados como indisponíveis."""
     delay_minutes = int(delay_minutes)
     if delay_minutes <= 0:
         return {"changed_ops": [], "moved_ops": []}
@@ -435,7 +444,7 @@ def apply_departure_delay_and_reassign(
         current_stand = str(op_row.get("stand_id", ""))
         op_cat = str(op_row.get("aircraft_category", "")).strip().upper()
 
-        if current_stand and is_feasible_assignment(
+        if current_stand and str(current_stand) not in (blocked_stands or []) and is_feasible_assignment(
             alloc=alloc,
             op_id=str(op_id),
             op_start=op_row.get("start_time"),
@@ -454,6 +463,7 @@ def apply_departure_delay_and_reassign(
             adjacency=adjacency,
             config=config,
             buffer_minutes=buffer_minutes,
+            blocked_stands=blocked_stands,
         )
         if new_stand is None:
             raise ValueError(
@@ -472,6 +482,83 @@ def apply_departure_delay_and_reassign(
             )
 
     return {"changed_ops": changed_ops, "moved_ops": moved_ops}
+
+
+def apply_gate_block(
+    alloc: pd.DataFrame,
+    blocked_stand: str,
+    block_date,
+    positions: pd.DataFrame,
+    adjacency: dict[str, list[str]],
+    config: ModelConfig,
+) -> dict:
+    """Bloqueia um portão para manutenção num dado dia.
+
+    - Marca o portão como bloqueado no session_state (chamador é responsável).
+    - Realoca todas as operações já alocadas naquele portão naquele dia para o
+      portão compatível mais próximo (menor walking_distance), sem reotimizar.
+    """
+    blocked_stand = str(blocked_stand)
+    buffer_minutes = int(config.turnaround_buffer_minutes)
+
+    # Operações alocadas no portão bloqueado, no dia em questão
+    mask = (
+        (alloc["stand_id"].astype(str) == blocked_stand)
+        & (alloc["start_time"].dt.date == block_date)
+    )
+    ops_to_move = alloc.loc[mask, "operation_id"].astype(str).tolist()
+
+    moved_ops: list[dict] = []
+    for op_id in ops_to_move:
+        op_row = alloc.loc[alloc["operation_id"].astype(str) == op_id].iloc[0]
+
+        # Encontra portão compatível excluindo o bloqueado
+        candidates = compatible_stands_for_operation(op_row, positions, config)
+        candidates = [s for s in candidates if str(s) != blocked_stand]
+
+        op_type = str(op_row.get("operation_type", "")).strip().lower()
+
+        def sort_key(stand_id: str):
+            stand_id = str(stand_id)
+            walking = float(positions.loc[stand_id, "walking_distance"]) if stand_id in positions.index else 1e9
+            if op_type == "parking":
+                is_parking_only = int(positions.loc[stand_id, "is_parking_only"]) if stand_id in positions.index else 0
+                return (0 if is_parking_only == 1 else 1, walking)
+            return (walking,)
+
+        new_stand = None
+        for s in sorted(candidates, key=sort_key):
+            if is_feasible_assignment(
+                alloc=alloc,
+                op_id=op_id,
+                op_start=op_row.get("start_time"),
+                op_end=op_row.get("end_time"),
+                op_cat=str(op_row.get("aircraft_category", "")).strip().upper(),
+                stand_id=s,
+                adjacency=adjacency,
+                buffer_minutes=buffer_minutes,
+            ):
+                new_stand = s
+                break
+
+        if new_stand is None:
+            raise ValueError(
+                f"Não há portão compatível disponível para realocar a operação {op_id} "
+                f"que estava no portão {blocked_stand}."
+            )
+
+        update_operation_stand_inplace(alloc, op_id=op_id, new_stand=new_stand, positions=positions)
+        moved_ops.append(
+            {
+                "operation_id": op_id,
+                "operation_type": str(op_row.get("operation_type", "")),
+                "stand_from": blocked_stand,
+                "stand_to": str(new_stand),
+            }
+        )
+
+    return {"moved_ops": moved_ops, "total": len(moved_ops)}
+
 
 # ── Tabs principais ─────────────────────────────────────────────────────────
 
@@ -720,6 +807,105 @@ with tab_results:
 
     alloc_day = alloc[alloc["start_time"].dt.date == selected_date].copy()
 
+    # ── Bloqueio de portão por manutenção ─────────────────────────────────
+
+    st.subheader("🔒 Bloqueio de portão por manutenção")
+    st.caption(
+        "Selecione um portão e marque-o como bloqueado para manutenção no dia selecionado. "
+        "Todos os voos já alocados nele serão realocados para o portão compatível mais próximo. "
+        "Voos atrasados também não poderão ser direcionados ao portão bloqueado."
+    )
+
+    # Inicializa conjunto de portões bloqueados no session_state
+    if "blocked_gates" not in st.session_state:
+        st.session_state["blocked_gates"] = {}  # {"YYYY-MM-DD": ["stand_id", ...]}
+
+    _date_key = selected_date.isoformat()
+    _blocked_today = st.session_state["blocked_gates"].get(_date_key, [])
+
+    _all_stands_day = sorted(
+        alloc_day["stand_id"].astype(str).unique().tolist(), key=stand_sort_key
+    ) if not alloc_day.empty else []
+
+    _available_to_block = [s for s in _all_stands_day if s not in _blocked_today]
+
+    _col_b1, _col_b2 = st.columns([3, 1])
+    _stand_to_block = _col_b1.selectbox(
+        "Portão para bloquear",
+        options=_available_to_block if _available_to_block else [""],
+        key=f"block_stand_{_date_key}",
+        disabled=not _available_to_block,
+    )
+    _do_block = _col_b2.button(
+        "🔒 Bloquear portão",
+        type="primary",
+        use_container_width=True,
+        key=f"do_block_{_date_key}",
+        disabled=not _available_to_block or not _stand_to_block,
+    )
+
+    if _do_block and _stand_to_block:
+        _block_positions_ok = Path(positions_path if "positions_path" in dir() else BASE_DIR / "posicoes.csv").exists()
+        try:
+            _bpos = positions_norm if "positions_norm" in dir() else None
+            _badj = adjacency if "adjacency" in dir() else {}
+            if _bpos is None:
+                st.error("Arquivo de posições não encontrado. Não é possível realocar.")
+            else:
+                _bsummary = apply_gate_block(
+                    alloc=alloc,
+                    blocked_stand=_stand_to_block,
+                    block_date=selected_date,
+                    positions=_bpos,
+                    adjacency=_badj,
+                    config=ModelConfig(),
+                )
+                # Registra portão bloqueado
+                _blocked_today_new = list(_blocked_today) + [str(_stand_to_block)]
+                st.session_state["blocked_gates"][_date_key] = _blocked_today_new
+
+                _moved = _bsummary.get("moved_ops", [])
+                if _moved:
+                    _parts = []
+                    for _item in _moved:
+                        _ot = OPERATION_LABELS.get(str(_item.get("operation_type", "")), str(_item.get("operation_type", "")))
+                        _parts.append(f"{_ot}: {_item.get('stand_from')}→{_item.get('stand_to')}")
+                    st.success(
+                        f"Portão **{_stand_to_block}** bloqueado para manutenção. "
+                        f"{_bsummary['total']} operação(ões) realocada(s): {'; '.join(_parts)}."
+                    )
+                else:
+                    st.success(
+                        f"Portão **{_stand_to_block}** bloqueado. Nenhuma operação precisou ser realocada."
+                    )
+        except Exception as _be:
+            st.error(f"Erro ao bloquear portão: {_be}")
+
+    # Exibe portões já bloqueados no dia
+    _blocked_now = st.session_state["blocked_gates"].get(_date_key, [])
+    if _blocked_now:
+        st.markdown(
+            f"**Portões bloqueados hoje ({selected_date.strftime('%d/%m/%Y')}):** "
+            + ", ".join([f"🔒 {s}" for s in _blocked_now])
+        )
+        _col_ub1, _ = st.columns([2, 4])
+        _unblock_stand = _col_ub1.selectbox(
+            "Desbloquear portão",
+            options=[""] + _blocked_now,
+            key=f"unblock_stand_{_date_key}",
+        )
+        if _unblock_stand:
+            if st.button(
+                f"🔓 Desbloquear {_unblock_stand}",
+                key=f"do_unblock_{_date_key}_{_unblock_stand}",
+            ):
+                _new_list = [s for s in _blocked_now if s != _unblock_stand]
+                st.session_state["blocked_gates"][_date_key] = _new_list
+                st.info(f"Portão {_unblock_stand} desbloqueado. As realocações anteriores permanecem ativas; reotimize se necessário.")
+                st.rerun()
+
+    st.divider()
+
     # ── Simulação de atraso (somente lista do dia) ─────────────────────────
 
     st.subheader("Simular atraso")
@@ -836,6 +1022,7 @@ with tab_results:
 
         if apply_delay:
             try:
+                _blocked_for_delay = st.session_state.get("blocked_gates", {}).get(selected_date.isoformat(), [])
                 summary = apply_departure_delay_and_reassign(
                     alloc=alloc,
                     visit_id=str(selected_visit_id),
@@ -843,6 +1030,7 @@ with tab_results:
                     positions=positions_norm,
                     adjacency=adjacency,
                     config=base_cfg,
+                    blocked_stands=_blocked_for_delay if _blocked_for_delay else None,
                 )
 
                 moved = summary.get("moved_ops", []) or []
