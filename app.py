@@ -1,10 +1,19 @@
 from __future__ import annotations
-from main import ModelConfig, solve_airport_stand_allocation
+from main import (
+    ModelConfig,
+    build_adjacent_stands,
+    intervals_overlap,
+    is_category_compatible,
+    normalize_flights,
+    normalize_positions,
+    solve_airport_stand_allocation,
+)
 
 import io
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -124,6 +133,345 @@ def normalize_company(value: str) -> str:
     if key == "latam":
         return "Latam"
     return text
+
+
+# ── Simulação de atrasos (sem reotimizar) ──────────────────────────────────
+
+
+_VISIT_ID_RE = re.compile(r"^V_(M\d{5})_(M\d{5})$")
+
+
+def parse_visit_movement_ids(visit_id: str) -> tuple[str | None, str | None]:
+    """Extrai (arrival_id, departure_id) do visit_id no formato 'V_M00001_M00002'."""
+    text = str(visit_id).strip()
+    match = _VISIT_ID_RE.match(text)
+    if not match:
+        return None, None
+    return match.group(1), match.group(2)
+
+
+def company_key(value: str) -> str:
+    return " ".join(str(value).split()).casefold()
+
+
+@st.cache_data(show_spinner=False)
+def load_positions_context(positions_path: str) -> tuple[pd.DataFrame, dict[str, list[str]]]:
+    raw = pd.read_csv(positions_path)
+    base_cfg = ModelConfig()
+    positions = normalize_positions(raw, base_cfg)
+    adjacency = build_adjacent_stands(positions)
+    positions = positions.set_index("stand_id", drop=False)
+    return positions, adjacency
+
+
+@st.cache_data(show_spinner=False)
+def load_flights_by_movement_id(flights_path: str) -> pd.DataFrame:
+    raw = pd.read_csv(flights_path)
+    flights = normalize_flights(raw)
+    return flights.set_index("movement_id", drop=False)
+
+
+def build_visit_flight_lookup(
+    visit_ids: list[str],
+    flights_by_id: pd.DataFrame,
+) -> dict[str, dict[str, str]]:
+    """Retorna metadados de voo (nº e horários) por visit_id, se disponível."""
+    lookup: dict[str, dict[str, str]] = {}
+    if flights_by_id is None or flights_by_id.empty:
+        return lookup
+
+    for visit_id in visit_ids:
+        arr_id, dep_id = parse_visit_movement_ids(visit_id)
+        info: dict[str, str] = {}
+
+        if arr_id and arr_id in flights_by_id.index:
+            info["arrival_flight_number"] = str(flights_by_id.loc[arr_id, "flight_number"])
+            info["arrival_time"] = str(flights_by_id.loc[arr_id, "datetime"])
+            info["arrival_od"] = str(flights_by_id.loc[arr_id, "origin_destination"])
+
+        if dep_id and dep_id in flights_by_id.index:
+            info["departure_flight_number"] = str(flights_by_id.loc[dep_id, "flight_number"])
+            info["departure_time"] = str(flights_by_id.loc[dep_id, "datetime"])
+            info["departure_od"] = str(flights_by_id.loc[dep_id, "origin_destination"])
+
+        if info:
+            lookup[str(visit_id)] = info
+
+    return lookup
+
+
+def compute_tows_from_allocation(alloc: pd.DataFrame) -> pd.DataFrame:
+    required = {"operation_id", "visit_id", "operation_type", "stand_id"}
+    if alloc is None or alloc.empty or not required.issubset(set(alloc.columns)):
+        return pd.DataFrame(columns=["operation_id", "visit_id", "successor_operation_id", "tow"])
+
+    op_to_stand = (
+        alloc[["operation_id", "stand_id"]]
+        .astype(str)
+        .drop_duplicates(subset=["operation_id"])
+        .set_index("operation_id")["stand_id"]
+        .to_dict()
+    )
+
+    rows: list[dict] = []
+    for _, row in alloc.iterrows():
+        op_type = str(row.get("operation_type", "")).strip().lower()
+        visit_id = str(row.get("visit_id", "")).strip()
+        op_id = str(row.get("operation_id", "")).strip()
+
+        if op_type == "arrival":
+            succ = f"{visit_id}_PARK"
+        elif op_type == "parking":
+            succ = f"{visit_id}_DEP"
+        else:
+            continue
+
+        if succ in op_to_stand and op_to_stand.get(op_id) != op_to_stand.get(succ):
+            rows.append(
+                {
+                    "operation_id": op_id,
+                    "visit_id": visit_id,
+                    "successor_operation_id": succ,
+                    "tow": 1,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def compatible_stands_for_operation(
+    op_row: pd.Series,
+    positions: pd.DataFrame,
+    config: ModelConfig,
+) -> list[str]:
+    op_cat = str(op_row.get("aircraft_category", "")).strip().upper()
+    allow_parking_only = str(op_row.get("operation_type", "")).strip().lower() == "parking"
+    company = str(op_row.get("company", "")).strip()
+    company_k = company_key(company)
+
+    de_allowed = {str(s).strip() for s in (config.de_allowed_stands or ())}
+    azul_only_company_keys = {
+        " ".join(str(c).split()).casefold() for c in (config.azul_only_companies or ())
+    }
+
+    candidates: list[str] = []
+    for stand_id, stand in positions.iterrows():
+        stand_id = str(stand_id)
+
+        if stand_id in (config.azul_only_stands or ()) and company_k not in azul_only_company_keys:
+            continue
+
+        if op_cat in {"D", "E"} and de_allowed and stand_id not in de_allowed:
+            continue
+
+        allowed_categories = stand.get("allowed_categories")
+        if not is_category_compatible(op_cat, allowed_categories):
+            continue
+
+        stand_is_parking_only = bool(stand.get("is_parking_only", 0))
+        if not allow_parking_only and stand_is_parking_only:
+            continue
+
+        candidates.append(stand_id)
+
+    return candidates
+
+
+def is_feasible_assignment(
+    alloc: pd.DataFrame,
+    op_id: str,
+    op_start: pd.Timestamp,
+    op_end: pd.Timestamp,
+    op_cat: str,
+    stand_id: str,
+    adjacency: dict[str, list[str]],
+    buffer_minutes: int,
+) -> bool:
+    if alloc is None or alloc.empty:
+        return True
+
+    buffer = pd.Timedelta(minutes=int(buffer_minutes))
+    op_id = str(op_id)
+    stand_id = str(stand_id)
+    op_cat = str(op_cat).strip().upper()
+
+    others = alloc[alloc["operation_id"].astype(str) != op_id]
+
+    # Conflito temporal na mesma posição.
+    same_stand = others[others["stand_id"].astype(str) == stand_id]
+    if not same_stand.empty:
+        time_conflict = same_stand[
+            (op_start < same_stand["end_time"] + buffer)
+            & (same_stand["start_time"] < op_end + buffer)
+        ]
+        if not time_conflict.empty:
+            return False
+
+    # Conflito por adjacência envolvendo D/E.
+    overlapping = others[
+        (op_start < others["end_time"] + buffer)
+        & (others["start_time"] < op_end + buffer)
+    ]
+    if overlapping.empty:
+        return True
+
+    if op_cat in {"D", "E"}:
+        adj_list = adjacency.get(stand_id, [])
+        if adj_list and overlapping["stand_id"].astype(str).isin(adj_list).any():
+            return False
+
+    blocking = overlapping[
+        overlapping["aircraft_category"].astype(str).str.strip().str.upper().isin(["D", "E"])
+    ]
+    if not blocking.empty:
+        for blocking_stand in blocking["stand_id"].astype(str).unique().tolist():
+            if stand_id in adjacency.get(str(blocking_stand), []):
+                return False
+
+    return True
+
+
+def choose_feasible_stand(
+    op_row: pd.Series,
+    alloc: pd.DataFrame,
+    positions: pd.DataFrame,
+    adjacency: dict[str, list[str]],
+    config: ModelConfig,
+    buffer_minutes: int,
+) -> str | None:
+    candidates = compatible_stands_for_operation(op_row, positions, config)
+    if not candidates:
+        return None
+
+    op_type = str(op_row.get("operation_type", "")).strip().lower()
+
+    def sort_key(stand_id: str):
+        stand_id = str(stand_id)
+        walking = float(positions.loc[stand_id, "walking_distance"]) if stand_id in positions.index else 1e9
+        if op_type == "parking":
+            is_parking_only = int(positions.loc[stand_id, "is_parking_only"]) if stand_id in positions.index else 0
+            return (0 if is_parking_only == 1 else 1, walking)
+        return (walking,)
+
+    for stand_id in sorted(candidates, key=sort_key):
+        if is_feasible_assignment(
+            alloc=alloc,
+            op_id=str(op_row.get("operation_id")),
+            op_start=op_row.get("start_time"),
+            op_end=op_row.get("end_time"),
+            op_cat=str(op_row.get("aircraft_category")),
+            stand_id=stand_id,
+            adjacency=adjacency,
+            buffer_minutes=buffer_minutes,
+        ):
+            return stand_id
+
+    return None
+
+
+def update_operation_stand_inplace(
+    alloc: pd.DataFrame,
+    op_id: str,
+    new_stand: str,
+    positions: pd.DataFrame,
+) -> None:
+    mask = alloc["operation_id"].astype(str) == str(op_id)
+    alloc.loc[mask, "stand_id"] = str(new_stand)
+
+    if str(new_stand) not in positions.index:
+        return
+
+    for col in ["stand_type", "walking_distance", "revenue_factor", "is_contact"]:
+        if col in alloc.columns and col in positions.columns:
+            alloc.loc[mask, col] = positions.loc[str(new_stand), col]
+
+
+def apply_departure_delay_and_reassign(
+    alloc: pd.DataFrame,
+    visit_id: str,
+    delay_minutes: int,
+    positions: pd.DataFrame,
+    adjacency: dict[str, list[str]],
+    config: ModelConfig,
+) -> dict:
+    """Aplica atraso na partida (em minutos) e realoca operações que entrarem em conflito."""
+    delay_minutes = int(delay_minutes)
+    if delay_minutes <= 0:
+        return {"changed_ops": [], "moved_ops": []}
+
+    visit_id = str(visit_id)
+    delta = pd.Timedelta(minutes=delay_minutes)
+
+    mask_visit = alloc["visit_id"].astype(str) == visit_id
+    if not mask_visit.any():
+        return {"changed_ops": [], "moved_ops": []}
+
+    # Atraso na PARTIDA:
+    # - turnaround: estende o fim
+    # - parking: estende o fim (mais tempo estacionado)
+    # - departure: desloca início e fim (mantém duração da etapa)
+    mask_turn = mask_visit & (alloc["operation_type"].astype(str).str.strip().str.lower() == "turnaround")
+    alloc.loc[mask_turn, "end_time"] = alloc.loc[mask_turn, "end_time"] + delta
+
+    mask_park = mask_visit & (alloc["operation_type"].astype(str).str.strip().str.lower() == "parking")
+    alloc.loc[mask_park, "end_time"] = alloc.loc[mask_park, "end_time"] + delta
+
+    mask_dep = mask_visit & (alloc["operation_type"].astype(str).str.strip().str.lower() == "departure")
+    alloc.loc[mask_dep, "start_time"] = alloc.loc[mask_dep, "start_time"] + delta
+    alloc.loc[mask_dep, "end_time"] = alloc.loc[mask_dep, "end_time"] + delta
+
+    changed_ops = alloc.loc[
+        mask_visit
+        & alloc["operation_type"].astype(str).str.strip().str.lower().isin(["turnaround", "parking", "departure"]),
+        "operation_id",
+    ].astype(str).tolist()
+
+    moved_ops: list[dict] = []
+    buffer_minutes = int(config.turnaround_buffer_minutes)
+
+    # Repara conflitos movendo só as operações afetadas, sem reotimizar.
+    for op_id in changed_ops:
+        op_row = alloc.loc[alloc["operation_id"].astype(str) == str(op_id)].iloc[0]
+        current_stand = str(op_row.get("stand_id", ""))
+        op_cat = str(op_row.get("aircraft_category", "")).strip().upper()
+
+        if current_stand and is_feasible_assignment(
+            alloc=alloc,
+            op_id=str(op_id),
+            op_start=op_row.get("start_time"),
+            op_end=op_row.get("end_time"),
+            op_cat=op_cat,
+            stand_id=current_stand,
+            adjacency=adjacency,
+            buffer_minutes=buffer_minutes,
+        ):
+            continue
+
+        new_stand = choose_feasible_stand(
+            op_row=op_row,
+            alloc=alloc,
+            positions=positions,
+            adjacency=adjacency,
+            config=config,
+            buffer_minutes=buffer_minutes,
+        )
+        if new_stand is None:
+            raise ValueError(
+                f"Não há portão compatível disponível para realocar {op_id} (visita {visit_id})."
+            )
+
+        if new_stand != current_stand:
+            update_operation_stand_inplace(alloc, op_id=op_id, new_stand=new_stand, positions=positions)
+            moved_ops.append(
+                {
+                    "operation_id": str(op_id),
+                    "operation_type": str(op_row.get("operation_type", "")),
+                    "stand_from": current_stand,
+                    "stand_to": str(new_stand),
+                }
+            )
+
+    return {"changed_ops": changed_ops, "moved_ops": moved_ops}
 
 # ── Tabs principais ─────────────────────────────────────────────────────────
 
@@ -275,6 +623,14 @@ with tab_config:
                 st.session_state["obj_value"] = result.objective_value
                 st.session_state["objective"] = objective
                 st.session_state["log"] = log_text
+                st.session_state["input_paths"] = {
+                    k: (str(v) if v is not None else None) for k, v in paths.items()
+                }
+                st.session_state["solution_id"] = f"run:{time.time_ns()}"
+
+                # Se já havia simulação de atraso na aba Resultados, reseta para o novo resultado.
+                for key in ("alloc_base", "alloc_current", "delay_events", "_active_solution_id"):
+                    st.session_state.pop(key, None)
 
                 st.success(
                     f"✅ Otimização concluída! Status: **{result.status}** · "
@@ -305,27 +661,32 @@ with tab_config:
 
 with tab_results:
 
-    if "alloc" not in st.session_state:
-        # Tenta carregar arquivos salvos em disco
+    # Carrega resultado (memória ou disco) e mantém um estado "corrente" para
+    # simular atrasos sem rodar o otimizador novamente.
+    if "alloc" in st.session_state:
+        alloc_loaded = st.session_state["alloc"].copy()
+        current_solution_id = st.session_state.get("solution_id") or "run:unknown"
+    else:
         alloc_path = BASE_DIR / "outputs" / "alocacao_resultado.csv"
-        tows_path = BASE_DIR / "outputs" / "reboques_resultado.csv"
-
         if alloc_path.exists():
-            alloc = pd.read_csv(alloc_path)
-            tows = pd.read_csv(
-                tows_path) if tows_path.exists() else pd.DataFrame()
-            alloc["start_time"] = pd.to_datetime(alloc["start_time"])
-            alloc["end_time"] = pd.to_datetime(alloc["end_time"])
+            alloc_loaded = pd.read_csv(alloc_path)
+            current_solution_id = f"disk:{alloc_path.stat().st_mtime_ns}:{alloc_path.stat().st_size}"
             st.info("Exibindo resultados do último arquivo salvo em disco.")
         else:
             st.warning(
                 "Nenhum resultado disponível. Execute a otimização na aba **Configuração**.")
             st.stop()
-    else:
-        alloc = st.session_state["alloc"].copy()
-        tows = st.session_state["tows"].copy()
-        alloc["start_time"] = pd.to_datetime(alloc["start_time"])
-        alloc["end_time"] = pd.to_datetime(alloc["end_time"])
+
+    alloc_loaded["start_time"] = pd.to_datetime(alloc_loaded["start_time"])
+    alloc_loaded["end_time"] = pd.to_datetime(alloc_loaded["end_time"])
+
+    if st.session_state.get("_active_solution_id") != current_solution_id:
+        st.session_state["_active_solution_id"] = current_solution_id
+        st.session_state["alloc_base"] = alloc_loaded.copy()
+        st.session_state["alloc_current"] = alloc_loaded.copy()
+        st.session_state["delay_events"] = []
+
+    alloc = st.session_state["alloc_current"]
 
     # Evita números como 107.0, 272.0 (pandas pode inferir float ao ler CSV)
     if "stand_id" in alloc.columns:
@@ -341,15 +702,15 @@ with tab_results:
         alloc["aircraft_category"] = alloc["aircraft_category"].astype(str)
     if "visit_id" in alloc.columns:
         alloc["visit_id"] = alloc["visit_id"].astype(str)
-    if not tows.empty and "operation_id" in tows.columns:
-        tows["operation_id"] = tows["operation_id"].astype(str)
-
     # ── Seleção de dia (afeta KPIs, Gantt e lista do dia) ──────────────────
 
     all_dates = sorted(alloc["start_time"].dt.date.unique())
     if not all_dates:
         st.warning("Nenhuma data encontrada nos resultados.")
         st.stop()
+
+    if "selected_date" in st.session_state and st.session_state["selected_date"] not in all_dates:
+        st.session_state.pop("selected_date", None)
 
     selected_date = st.selectbox(
         "Data",
@@ -359,9 +720,193 @@ with tab_results:
 
     alloc_day = alloc[alloc["start_time"].dt.date == selected_date].copy()
 
-    if tows.empty:
-        tows_day = tows.copy()
+    # ── Simulação de atraso (somente lista do dia) ─────────────────────────
+
+    st.subheader("Simular atraso")
+    st.caption(
+        "Atraso aplicado na partida (estende a permanência em solo). "
+        "Se houver conflito de portão, o voo é realocado automaticamente para um portão compatível disponível."
+    )
+
+    input_paths = st.session_state.get("input_paths") or {}
+    positions_path = input_paths.get("positions") or str(BASE_DIR / "posicoes.csv")
+    flights_path = input_paths.get("flights") or str(BASE_DIR / "voos.csv")
+
+    positions_ok = Path(positions_path).exists()
+    if not positions_ok:
+        st.warning(
+            "Não foi possível carregar o arquivo de posições (posicoes.csv). "
+            "A simulação de atraso/realocação depende dele."
+        )
+    elif alloc_day.empty:
+        st.info("Nenhuma operação no dia selecionado.")
     else:
+        base_cfg = ModelConfig()
+        positions_norm, adjacency = load_positions_context(str(positions_path))
+
+        flights_by_id = pd.DataFrame()
+        if Path(flights_path).exists():
+            try:
+                flights_by_id = load_flights_by_movement_id(str(flights_path))
+            except Exception:
+                flights_by_id = pd.DataFrame()
+
+        visit_ids_day = sorted(alloc_day["visit_id"].astype(str).unique().tolist())
+        visit_flights = build_visit_flight_lookup(visit_ids_day, flights_by_id)
+
+        gate_rows = alloc_day[
+            alloc_day["operation_type"].astype(str).str.strip().str.lower().isin(["turnaround", "departure"])
+        ]
+        gate_by_visit = (
+            gate_rows.sort_values("start_time")
+            .groupby("visit_id")["stand_id"]
+            .first()
+            .astype(str)
+            .to_dict()
+        )
+
+        visits_day = (
+            alloc_day.groupby("visit_id")
+            .agg(
+                company=("company", "first"),
+                aircraft_category=("aircraft_category", "first"),
+                visit_start=("start_time", "min"),
+                visit_end=("end_time", "max"),
+            )
+            .reset_index()
+            .sort_values("visit_start")
+            .reset_index(drop=True)
+        )
+        visits_day["gate_stand"] = visits_day["visit_id"].map(gate_by_visit).fillna("")
+        visits_day["dep_flight"] = visits_day["visit_id"].map(
+            lambda vid: visit_flights.get(str(vid), {}).get("departure_flight_number", "")
+        )
+        visits_day["arr_flight"] = visits_day["visit_id"].map(
+            lambda vid: visit_flights.get(str(vid), {}).get("arrival_flight_number", "")
+        )
+
+        visit_labels: dict[str, str] = {}
+        for _, r in visits_day.iterrows():
+            vid = str(r["visit_id"])
+            dep = str(r.get("dep_flight") or "").strip()
+            arr = str(r.get("arr_flight") or "").strip()
+            comp = str(r.get("company") or "").strip()
+            stand = str(r.get("gate_stand") or "").strip()
+            start = r.get("visit_start")
+            end = r.get("visit_end")
+
+            flight_part = vid
+            if arr and dep:
+                flight_part = f"{comp} · {arr}→{dep}"
+            elif dep:
+                flight_part = f"{comp} · DEP {dep}"
+            elif comp:
+                flight_part = f"{comp} · {vid}"
+
+            if pd.notna(start) and pd.notna(end):
+                time_part = f"{pd.to_datetime(start).strftime('%H:%M')}–{pd.to_datetime(end).strftime('%H:%M')}"
+            else:
+                time_part = ""
+
+            stand_part = f"Portão {stand}" if stand else ""
+            extra = " · ".join([p for p in [time_part, stand_part, vid] if p])
+            visit_labels[vid] = f"{flight_part} · {extra}" if extra else flight_part
+
+        col_d1, col_d2, col_d3 = st.columns([3, 1, 1])
+        selected_visit_id = col_d1.selectbox(
+            "Voo/visita (somente do dia)",
+            options=visits_day["visit_id"].astype(str).tolist(),
+            format_func=lambda vid: visit_labels.get(str(vid), str(vid)),
+            key=f"delay_visit_{selected_date.isoformat()}",
+        )
+        delay_minutes = col_d2.number_input(
+            "Atraso (min)",
+            min_value=0,
+            max_value=600,
+            value=15,
+            step=5,
+            key=f"delay_minutes_{selected_date.isoformat()}",
+        )
+        apply_delay = col_d3.button(
+            "Aplicar atraso",
+            type="primary",
+            use_container_width=True,
+            key=f"apply_delay_{selected_date.isoformat()}",
+        )
+
+        if apply_delay:
+            try:
+                summary = apply_departure_delay_and_reassign(
+                    alloc=alloc,
+                    visit_id=str(selected_visit_id),
+                    delay_minutes=int(delay_minutes),
+                    positions=positions_norm,
+                    adjacency=adjacency,
+                    config=base_cfg,
+                )
+
+                moved = summary.get("moved_ops", []) or []
+                moved_summary = ""
+                if moved:
+                    parts = []
+                    for item in moved:
+                        op_t = str(item.get("operation_type", "")).strip()
+                        op_t = OPERATION_LABELS.get(op_t, op_t)
+                        parts.append(f"{op_t}: {item.get('stand_from')}→{item.get('stand_to')}")
+                    moved_summary = "; ".join(parts)
+
+                dep_flight = visit_flights.get(str(selected_visit_id), {}).get("departure_flight_number", "")
+                company = (
+                    alloc.loc[alloc["visit_id"].astype(str) == str(selected_visit_id), "company"].astype(str).head(1).tolist()
+                    or [""]
+                )[0]
+
+                st.session_state.setdefault("delay_events", []).append(
+                    {
+                        "date": selected_date.isoformat(),
+                        "visit_id": str(selected_visit_id),
+                        "company": str(company),
+                        "departure_flight": str(dep_flight),
+                        "delay_minutes": int(delay_minutes),
+                        "moved": moved_summary,
+                    }
+                )
+
+                if moved_summary:
+                    st.success(f"Atraso aplicado. Realocação: {moved_summary}.")
+                else:
+                    st.success("Atraso aplicado. Nenhuma realocação foi necessária.")
+
+            except Exception as e:
+                st.error(f"Não foi possível aplicar o atraso: {e}")
+
+        # Recarrega a fatia do dia após possíveis mudanças.
+        alloc_day = alloc[alloc["start_time"].dt.date == selected_date].copy()
+
+        events_day = [
+            e for e in (st.session_state.get("delay_events") or [])
+            if str(e.get("date")) == selected_date.isoformat()
+        ]
+        if events_day:
+            st.markdown("**Voos com atraso (dia selecionado)**")
+            events_table = pd.DataFrame(
+                [
+                    {
+                        "Voo (partida)": e.get("departure_flight", ""),
+                        "Empresa": e.get("company", ""),
+                        "Visita": e.get("visit_id", ""),
+                        "Atraso (min)": e.get("delay_minutes", 0),
+                        "Realocação": e.get("moved", ""),
+                    }
+                    for e in events_day
+                ]
+            )
+            st.dataframe(events_table, use_container_width=True, hide_index=True)
+
+    # ── Reboques (recalculado a partir da alocação atual) ─────────────────
+
+    tows = compute_tows_from_allocation(alloc)
+    if not tows.empty:
         tows_with_time = tows.merge(
             alloc[["operation_id", "start_time"]],
             on="operation_id",
@@ -372,6 +917,8 @@ with tab_results:
             .drop(columns=["start_time"], errors="ignore")
             .reset_index(drop=True)
         )
+    else:
+        tows_day = tows.copy()
 
     # ── KPIs + métricas (dia selecionado) ─────────────────────────────────
 
