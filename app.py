@@ -844,20 +844,25 @@ with tab_results:
         disabled=not _available_to_block or not _stand_to_block,
     )
 
+    # Carrega posições/adjacência para uso no bloqueio e na simulação de atraso
+    _input_paths_ui = st.session_state.get("input_paths") or {}
+    _pos_path_ui = _input_paths_ui.get("positions") or str(BASE_DIR / "posicoes.csv")
+    if Path(_pos_path_ui).exists():
+        _positions_norm_ui, _adjacency_ui = load_positions_context(str(_pos_path_ui))
+    else:
+        _positions_norm_ui, _adjacency_ui = None, {}
+
     if _do_block and _stand_to_block:
-        _block_positions_ok = Path(positions_path if "positions_path" in dir() else BASE_DIR / "posicoes.csv").exists()
         try:
-            _bpos = positions_norm if "positions_norm" in dir() else None
-            _badj = adjacency if "adjacency" in dir() else {}
-            if _bpos is None:
-                st.error("Arquivo de posições não encontrado. Não é possível realocar.")
+            if _positions_norm_ui is None:
+                st.error("Arquivo posicoes.csv não encontrado. Não é possível realocar.")
             else:
                 _bsummary = apply_gate_block(
                     alloc=alloc,
                     blocked_stand=_stand_to_block,
                     block_date=selected_date,
-                    positions=_bpos,
-                    adjacency=_badj,
+                    positions=_positions_norm_ui,
+                    adjacency=_adjacency_ui,
                     config=ModelConfig(),
                 )
                 # Registra portão bloqueado
