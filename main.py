@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+import datetime as dt
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import gurobipy as gp
@@ -67,6 +69,332 @@ class ModelConfig:
     # Ex.: inclui "Azul Conecta" por fazer parte da operação Azul.
     azul_only_companies: Tuple[str, ...] = ("Azul", "Azul Conecta")
 
+    # Portões fora de operação: removidos do conjunto compatível antes do Gurobi.
+    unavailable_stands: Tuple[str, ...] = ()
+
+    # Bloqueios operacionais: dicts com date, start_time e end_time ou duration_hours.
+    operational_blocks: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Espaçamento aplicado aos movimentos empurrados para depois de um bloqueio.
+    operational_block_spacing_minutes: int = 5
+
+
+
+
+_STAND_ID_INT_RE = re.compile(r"^(\d+)(?:\.0+)?$")
+
+
+def normalize_stand_id(value: object) -> str:
+    """Normaliza IDs de portão, evitando diferenças como 107, 107.0 e '107'."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value).strip()
+    match = _STAND_ID_INT_RE.match(text)
+    return match.group(1) if match else text
+
+
+def parse_operational_block_intervals(
+    config: ModelConfig,
+) -> tuple[list[tuple[pd.Timestamp, pd.Timestamp]], pd.Timedelta]:
+    """Converte bloqueios da configuração em intervalos ordenados e mesclados."""
+    blocks = list(config.operational_blocks or [])
+    if not blocks:
+        return [], pd.Timedelta(minutes=max(1, int(config.operational_block_spacing_minutes or 1)))
+
+    spacing = pd.Timedelta(minutes=max(1, int(config.operational_block_spacing_minutes or 1)))
+
+    def first(block: dict, *keys: str) -> object:
+        for key in keys:
+            if key in block and block[key] not in (None, ""):
+                return block[key]
+        return None
+
+    def to_date(value: object) -> dt.date:
+        if isinstance(value, pd.Timestamp):
+            return value.date()
+        if isinstance(value, dt.datetime):
+            return value.date()
+        if isinstance(value, dt.date):
+            return value
+        parsed = pd.to_datetime(str(value).strip(), dayfirst=True, errors="coerce")
+        if pd.isna(parsed):
+            raise ValueError(f"Data inválida no bloqueio operacional: {value!r}")
+        return parsed.date()
+
+    def to_time(value: object) -> dt.time:
+        if isinstance(value, dt.datetime):
+            return value.time().replace(second=0, microsecond=0)
+        if isinstance(value, dt.time):
+            return value.replace(second=0, microsecond=0)
+        parsed = pd.to_datetime(str(value).strip(), errors="coerce")
+        if pd.isna(parsed):
+            raise ValueError(f"Hora inválida no bloqueio operacional: {value!r}")
+        return parsed.time().replace(second=0, microsecond=0)
+
+    intervals: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            raise ValueError(f"Bloqueio operacional inválido: {block!r}")
+
+        raw_date = first(block, "date", "data")
+        raw_start = first(block, "start_time", "start", "inicio", "início")
+        raw_end = first(block, "end_time", "end", "fim")
+        raw_duration = first(block, "duration_hours", "duration", "duracao_horas", "duração_horas")
+
+        if raw_date is None or raw_start is None:
+            raise ValueError("Bloqueio operacional precisa de date e start_time.")
+
+        block_date = to_date(raw_date)
+        start_dt = pd.Timestamp(dt.datetime.combine(block_date, to_time(raw_start)))
+
+        if raw_end is not None:
+            end_dt = pd.Timestamp(dt.datetime.combine(block_date, to_time(raw_end)))
+            if end_dt < start_dt:
+                end_dt += pd.Timedelta(days=1)
+        elif raw_duration is not None:
+            duration = float(raw_duration)
+            if duration <= 0:
+                raise ValueError("duration_hours deve ser maior que zero.")
+            end_dt = start_dt + pd.Timedelta(hours=duration)
+        else:
+            raise ValueError("Bloqueio operacional precisa de end_time ou duration_hours.")
+
+        if end_dt <= start_dt:
+            raise ValueError(f"Intervalo inválido: {start_dt} até {end_dt}")
+        intervals.append((start_dt, end_dt))
+
+    intervals.sort(key=lambda x: x[0])
+    merged: list[list[pd.Timestamp]] = []
+    for start_dt, end_dt in intervals:
+        if not merged or start_dt > merged[-1][1]:
+            merged.append([start_dt, end_dt])
+        else:
+            merged[-1][1] = max(merged[-1][1], end_dt)
+
+    return [(a, b) for a, b in merged], spacing
+
+
+def apply_operational_blocks_to_visits(
+    visits: pd.DataFrame,
+    config: ModelConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Ajusta o planejamento antes do Gurobi e cria operações de sobrevoo.
+
+    O Gurobi deste projeto decide apenas a posição/portão, não decide horário.
+    Por isso, bloqueios operacionais devem ser tratados nos dados planejados
+    antes de criar as operações que entram no modelo.
+
+    Regras aplicadas:
+    - Se a chegada planejada cair dentro do bloqueio, o avião fica em sobrevoo
+      do horário original de chegada até o primeiro horário livre após o bloqueio.
+      A visita em solo é deslocada para esse novo horário de pouso, preservando
+      a duração original em solo.
+    - Se o avião já estiver no chão quando o bloqueio começa e sua partida cair
+      dentro do bloqueio, a permanência em solo é estendida até depois do fim do
+      bloqueio.
+    - As operações de sobrevoo são retornadas separadamente para aparecerem no
+      resultado, mas não entram no Gurobi nem consomem portão.
+    """
+    empty_holding = pd.DataFrame(
+        columns=[
+            "operation_id",
+            "visit_id",
+            "operation_type",
+            "start_time",
+            "end_time",
+            "pax",
+            "company",
+            "aircraft_category",
+            "successor_operation_id",
+            "allow_parking_only",
+            "stand_id",
+            "stand_type",
+            "walking_distance",
+            "revenue_factor",
+            "is_contact",
+            "block_reason",
+        ]
+    )
+
+    if visits is None or visits.empty:
+        return visits, empty_holding
+
+    intervals, spacing = parse_operational_block_intervals(config)
+    if not intervals:
+        return visits, empty_holding
+
+    df = visits.copy()
+    df["arrival_time"] = pd.to_datetime(df["arrival_time"], errors="coerce")
+    df["departure_time"] = pd.to_datetime(df["departure_time"], errors="coerce")
+    df = df.dropna(subset=["arrival_time", "departure_time"]).copy()
+    df = df[df["departure_time"] > df["arrival_time"]].copy()
+
+    # Cada bloqueio mantém slots separados para pousos liberados e partidas liberadas.
+    # Assim evitamos criar vários movimentos exatamente no mesmo minuto.
+    next_arrival_slot: dict[tuple[pd.Timestamp, pd.Timestamp], pd.Timestamp] = {
+        block: block[1] + spacing for block in intervals
+    }
+    next_departure_slot: dict[tuple[pd.Timestamp, pd.Timestamp], pd.Timestamp] = {
+        block: block[1] + spacing for block in intervals
+    }
+
+    def containing_block(ts: pd.Timestamp) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+        ts = pd.Timestamp(ts)
+        for start_dt, end_dt in intervals:
+            # Tratamos bloqueio como [início, fim): exatamente no fim já é liberado.
+            if start_dt <= ts < end_dt:
+                return start_dt, end_dt
+        return None
+
+    def next_slot_after(block: tuple[pd.Timestamp, pd.Timestamp], kind: str) -> pd.Timestamp:
+        if kind == "arrival":
+            slot = next_arrival_slot[block]
+            next_arrival_slot[block] = slot + spacing
+            return slot
+        slot = next_departure_slot[block]
+        next_departure_slot[block] = slot + spacing
+        return slot
+
+    holding_rows: list[dict] = []
+
+    sort_cols = [c for c in ["arrival_time", "departure_time", "visit_id"] if c in df.columns]
+    df = df.sort_values(sort_cols, kind="mergesort").copy()
+
+    for idx in df.index.tolist():
+        visit_id = str(df.at[idx, "visit_id"])
+        arr = pd.Timestamp(df.at[idx, "arrival_time"])
+        dep = pd.Timestamp(df.at[idx, "departure_time"])
+        original_ground_duration = dep - arr
+
+        # 1) Chegada durante bloqueio: cria sobrevoo e desloca a visita em solo.
+        # Pode haver mais de um bloqueio se o novo horário cair em outro intervalo.
+        holding_count = 0
+        while True:
+            block = containing_block(arr)
+            if block is None:
+                break
+
+            old_arr = arr
+            new_arr = next_slot_after(block, "arrival")
+            holding_count += 1
+            holding_rows.append(
+                {
+                    "operation_id": f"{visit_id}_HOLD{holding_count}",
+                    "visit_id": visit_id,
+                    "operation_type": "holding",
+                    "start_time": old_arr,
+                    "end_time": new_arr,
+                    "pax": 0,
+                    "company": df.at[idx, "company"],
+                    "aircraft_category": df.at[idx, "aircraft_category"],
+                    "successor_operation_id": None,
+                    "allow_parking_only": False,
+                    "stand_id": "SOBREVOO",
+                    "stand_type": "sobrevoo",
+                    "walking_distance": 0.0,
+                    "revenue_factor": 0.0,
+                    "is_contact": 0,
+                    "block_reason": "bloqueio operacional",
+                }
+            )
+
+            arr = new_arr
+            dep = arr + original_ground_duration
+
+        # 2) Avião no chão durante o bloqueio com partida dentro do bloqueio:
+        # estende a permanência até depois do fim do bloqueio.
+        while True:
+            block = containing_block(dep)
+            if block is None:
+                break
+
+            start_dt, _ = block
+            if arr < start_dt:
+                dep = next_slot_after(block, "departure")
+            else:
+                # Segurança: se por algum motivo a chegada ajustada ainda cair no bloqueio,
+                # volta para a regra de sobrevoo.
+                new_arr = next_slot_after(block, "arrival")
+                old_arr = arr
+                holding_count += 1
+                holding_rows.append(
+                    {
+                        "operation_id": f"{visit_id}_HOLD{holding_count}",
+                        "visit_id": visit_id,
+                        "operation_type": "holding",
+                        "start_time": old_arr,
+                        "end_time": new_arr,
+                        "pax": 0,
+                        "company": df.at[idx, "company"],
+                        "aircraft_category": df.at[idx, "aircraft_category"],
+                        "successor_operation_id": None,
+                        "allow_parking_only": False,
+                        "stand_id": "SOBREVOO",
+                        "stand_type": "sobrevoo",
+                        "walking_distance": 0.0,
+                        "revenue_factor": 0.0,
+                        "is_contact": 0,
+                        "block_reason": "bloqueio operacional",
+                    }
+                )
+                arr = new_arr
+                dep = arr + original_ground_duration
+
+        if dep <= arr:
+            dep = arr + spacing
+
+        df.at[idx, "arrival_time"] = arr
+        df.at[idx, "departure_time"] = dep
+
+    turnaround = (df["departure_time"] - df["arrival_time"]).dt.total_seconds() / 60.0
+    df["turnaround_minutes"] = turnaround.round().astype(int)
+    df["is_long_stay"] = (df["turnaround_minutes"] > int(config.tow_threshold_minutes)).astype(int)
+
+    holding_df = pd.DataFrame(holding_rows) if holding_rows else empty_holding
+    if not holding_df.empty:
+        holding_df["start_time"] = pd.to_datetime(holding_df["start_time"])
+        holding_df["end_time"] = pd.to_datetime(holding_df["end_time"])
+        holding_df = holding_df[holding_df["end_time"] > holding_df["start_time"]].copy()
+        holding_df = holding_df.sort_values(["start_time", "visit_id"]).reset_index(drop=True)
+
+    return df.sort_values("arrival_time").reset_index(drop=True), holding_df
+
+
+def validate_no_blocked_movements(operations: pd.DataFrame, config: ModelConfig) -> None:
+    """Valida apenas movimentos de pouso/decolagem dentro dos bloqueios.
+
+    Barras podem atravessar o bloqueio se o avião já estava em solo; o que não
+    pode é haver começo de chegada/pouso ou fim de partida/decolagem dentro do
+    intervalo bloqueado.
+    """
+    intervals, _ = parse_operational_block_intervals(config)
+    if not intervals or operations is None or operations.empty:
+        return
+
+    errors: list[str] = []
+    for _, op in operations.iterrows():
+        op_id = str(op.get("operation_id", ""))
+        op_type = str(op.get("operation_type", "")).strip().lower()
+        op_start = pd.Timestamp(op["start_time"])
+        op_end = pd.Timestamp(op["end_time"])
+
+        for start_dt, end_dt in intervals:
+            if op_type in {"turnaround", "arrival"} and start_dt <= op_start < end_dt:
+                errors.append(f"{op_id}: chegada/pouso em {op_start:%Y-%m-%d %H:%M}")
+            if op_type in {"turnaround", "departure"} and start_dt <= op_end < end_dt:
+                errors.append(f"{op_id}: partida/decolagem em {op_end:%Y-%m-%d %H:%M}")
+
+    if errors:
+        raise ValueError(
+            "Ainda existem pousos/decolagens dentro de bloqueios operacionais: "
+            + "; ".join(errors[:30])
+            + ("..." if len(errors) > 30 else "")
+        )
 
 # ============================================================
 # Leitura e preparação dos dados
@@ -79,6 +407,7 @@ class ProblemData:
     positions: pd.DataFrame
     visits: pd.DataFrame
     operations: pd.DataFrame
+    holding_operations: pd.DataFrame
     compatible_stands: Dict[str, List[str]]
     overlapping_ops: Dict[str, List[str]]
     overlapping_stands: Dict[str, List[str]]
@@ -416,7 +745,8 @@ def build_compatible_stands(
 ) -> Dict[str, List[str]]:
     compatible: Dict[str, List[str]] = {}
 
-    de_allowed = {str(s).strip() for s in (config.de_allowed_stands or ())}
+    de_allowed = {normalize_stand_id(s) for s in (config.de_allowed_stands or ())}
+    unavailable = {normalize_stand_id(s) for s in (config.unavailable_stands or ()) if normalize_stand_id(s)}
     azul_only_company_keys = {
         " ".join(str(c).split()).casefold() for c in (config.azul_only_companies or ())
     }
@@ -430,9 +760,12 @@ def build_compatible_stands(
 
         candidates: List[str] = []
         for _, stand in positions.iterrows():
-            stand_id = stand["stand_id"]
+            stand_id = normalize_stand_id(stand["stand_id"])
             allowed_categories = stand["allowed_categories"]
             stand_is_parking_only = bool(stand["is_parking_only"])
+
+            if unavailable and stand_id in unavailable:
+                continue
 
             # Portões 107–115 exclusivos para voos da Azul.
             if stand_id in (config.azul_only_stands or ()) and company_key not in azul_only_company_keys:
@@ -529,7 +862,9 @@ def prepare_problem_data(
     positions = normalize_positions(positions_raw, config)
     aircraft_category_map = build_aircraft_category_map(aircraft_categories_raw, config)
     visits = reconstruct_visits(flights, aircraft_category_map, config)
+    visits, holding_operations = apply_operational_blocks_to_visits(visits, config)
     operations = build_operations(visits, config)
+    validate_no_blocked_movements(operations, config)
     compatible_stands = build_compatible_stands(operations, positions, config)
     overlapping_ops = build_overlapping_operations(operations, config.turnaround_buffer_minutes)
 
@@ -541,6 +876,7 @@ def prepare_problem_data(
         positions=positions,
         visits=visits,
         operations=operations,
+        holding_operations=holding_operations,
         compatible_stands=compatible_stands,
         overlapping_ops=overlapping_ops,
         overlapping_stands=overlapping_stands,
@@ -765,7 +1101,36 @@ def extract_solution(
                 }
             )
 
-    allocation_df = pd.DataFrame(allocation_rows).sort_values(["start_time", "stand_id"]).reset_index(drop=True)
+    allocation_df = pd.DataFrame(allocation_rows)
+
+    # Operações de sobrevoo são resultado do ajuste de planejamento, não são
+    # variáveis do Gurobi e não consomem portão. Elas são anexadas ao resultado
+    # para aparecerem no CSV/Gantt como “SOBREVOO”.
+    holding_df = getattr(problem, "holding_operations", pd.DataFrame())
+    if holding_df is not None and not holding_df.empty:
+        needed_cols = [
+            "operation_id",
+            "visit_id",
+            "operation_type",
+            "company",
+            "aircraft_category",
+            "start_time",
+            "end_time",
+            "pax",
+            "stand_id",
+            "stand_type",
+            "walking_distance",
+            "revenue_factor",
+            "is_contact",
+        ]
+        for col in needed_cols:
+            if col not in holding_df.columns:
+                holding_df[col] = "" if col not in {"pax", "walking_distance", "revenue_factor", "is_contact"} else 0
+        allocation_df = pd.concat([allocation_df, holding_df[needed_cols]], ignore_index=True)
+
+    if not allocation_df.empty:
+        allocation_df = allocation_df.sort_values(["start_time", "stand_id"]).reset_index(drop=True)
+
     tows_df = pd.DataFrame(tow_rows).reset_index(drop=True)
 
     return OptimizationResult(

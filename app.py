@@ -9,6 +9,7 @@ from main import (
     solve_airport_stand_allocation,
 )
 
+import datetime as dt
 import io
 import re
 import sys
@@ -39,6 +40,7 @@ OPERATION_COLOR = {
     "arrival": "#0B6E4F",     # verde escuro
     "parking": "#374151",     # cinza escuro
     "departure": "#B45309",   # âmbar escuro
+    "holding": "#6B7280",     # sobrevoo/espera fora do portão
 }
 
 COMPANY_COLOR = {
@@ -54,6 +56,7 @@ OPERATION_LABELS = {
     "arrival": "Arrival",
     "parking": "Parking",
     "departure": "Departure",
+    "holding": "Sobrevoo",
 }
 
 STAND_COLOR = {
@@ -169,6 +172,23 @@ def load_flights_by_movement_id(flights_path: str) -> pd.DataFrame:
     raw = pd.read_csv(flights_path)
     flights = normalize_flights(raw)
     return flights.set_index("movement_id", drop=False)
+
+
+@st.cache_data(show_spinner=False)
+def load_flight_dates_for_block_config(flights_path: str) -> list[dt.date]:
+    """Lê as datas disponíveis no planejamento para evitar bloqueio em data errada."""
+    raw = pd.read_csv(flights_path)
+    flights = normalize_flights(raw)
+    dates = sorted(flights["datetime"].dt.date.dropna().unique().tolist())
+    return dates
+
+def get_uploaded_flight_dates(uploaded_file) -> list[dt.date]:
+    """Lê datas do voos.csv enviado via upload sem alterar o arquivo original."""
+    if uploaded_file is None:
+        return []
+    raw = pd.read_csv(io.BytesIO(uploaded_file.getvalue()))
+    flights = normalize_flights(raw)
+    return sorted(flights["datetime"].dt.date.dropna().unique().tolist())
 
 
 def build_visit_flight_lookup(
@@ -627,6 +647,97 @@ with tab_config:
             "Limiar longa permanência (min)", min_value=60, max_value=360, value=180)
 
     st.divider()
+    st.subheader("Bloqueios operacionais")
+    st.caption(
+        "Durante estes intervalos, chegadas e partidas são empurradas para depois do fim do bloqueio antes do Gurobi."
+    )
+
+    if "operational_blocks_ui" not in st.session_state:
+        st.session_state["operational_blocks_ui"] = []
+
+    operational_block_spacing_minutes = st.number_input(
+        "Espaçamento entre movimentos ajustados (min)",
+        min_value=1,
+        max_value=30,
+        value=5,
+        step=1,
+        key="operational_block_spacing_minutes",
+    )
+
+    # Datas reais existentes no planejamento. O erro mais comum era adicionar o
+    # bloqueio na data de hoje, enquanto o voo exibido era de outra data
+    # (ex.: 06/03/2026). Assim o pré-processamento não encontrava nada para ajustar.
+    try:
+        if use_default:
+            _flight_dates_for_blocks = load_flight_dates_for_block_config(str(BASE_DIR / "voos.csv"))
+        else:
+            _flight_dates_for_blocks = get_uploaded_flight_dates(up_voos)
+    except Exception:
+        _flight_dates_for_blocks = []
+
+    if _flight_dates_for_blocks:
+        st.caption(
+            "Datas disponíveis no planejamento: "
+            + ", ".join(d.strftime("%d/%m/%Y") for d in _flight_dates_for_blocks[:10])
+            + ("..." if len(_flight_dates_for_blocks) > 10 else "")
+        )
+    else:
+        st.warning(
+            "Não consegui ler as datas do voos.csv. Confira se o bloqueio está na mesma data dos voos."
+        )
+
+    with st.form("operational_block_form", clear_on_submit=True):
+        c_b1, c_b2, c_b3, c_b4 = st.columns([1.2, 1, 1, 2])
+
+        if _flight_dates_for_blocks:
+            block_date = c_b1.selectbox(
+                "Data do bloqueio",
+                options=_flight_dates_for_blocks,
+                format_func=lambda d: d.strftime("%d/%m/%Y"),
+                key="block_date_select",
+            )
+        else:
+            block_date = c_b1.date_input("Data do bloqueio", value=dt.date.today(), key="block_date")
+
+        block_start = c_b2.time_input("Início", value=dt.time(9, 0), key="block_start")
+        block_end = c_b3.time_input("Fim", value=dt.time(10, 45), key="block_end")
+        block_reason = c_b4.text_input("Motivo", value="", key="block_reason")
+
+        if st.form_submit_button("Adicionar bloqueio"):
+            block_item = {
+                "date": block_date.isoformat(),
+                "start_time": block_start.strftime("%H:%M"),
+                "end_time": block_end.strftime("%H:%M"),
+                "reason": str(block_reason).strip(),
+            }
+            st.session_state["operational_blocks_ui"].append(block_item)
+            st.success(
+                "Bloqueio adicionado para "
+                f"{block_date.strftime('%d/%m/%Y')} das "
+                f"{block_start.strftime('%H:%M')} às {block_end.strftime('%H:%M')}."
+            )
+
+    blocks_now = list(st.session_state.get("operational_blocks_ui") or [])
+    if blocks_now:
+        st.dataframe(
+            pd.DataFrame(blocks_now).rename(
+                columns={
+                    "date": "Data",
+                    "start_time": "Início",
+                    "end_time": "Fim",
+                    "reason": "Motivo",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+        if st.button("Limpar bloqueios operacionais"):
+            st.session_state["operational_blocks_ui"] = []
+            st.rerun()
+    else:
+        st.info("Nenhum bloqueio operacional configurado.")
+
+    st.divider()
 
     # ── Botão de execução ───────────────────────────────────────────────────
 
@@ -646,6 +757,8 @@ with tab_config:
             min_turnaround_minutes=int(min_turn),
             max_turnaround_minutes=int(max_turn),
             tow_threshold_minutes=int(tow_thr),
+            operational_blocks=list(st.session_state.get("operational_blocks_ui") or []),
+            operational_block_spacing_minutes=int(operational_block_spacing_minutes),
         )
 
         # Resolve caminhos (default ou upload)
@@ -714,6 +827,22 @@ with tab_config:
                     k: (str(v) if v is not None else None) for k, v in paths.items()
                 }
                 st.session_state["solution_id"] = f"run:{time.time_ns()}"
+                st.session_state["operational_blocks"] = list(config.operational_blocks or [])
+                st.session_state["operational_block_spacing_minutes_used"] = int(config.operational_block_spacing_minutes)
+
+                if config.operational_blocks:
+                    st.info(
+                        "Bloqueios aplicados nesta otimização: "
+                        + "; ".join(
+                            f"{b.get('date')} {b.get('start_time')}–{b.get('end_time')}"
+                            for b in config.operational_blocks
+                        )
+                    )
+                else:
+                    st.warning(
+                        "A otimização foi executada sem bloqueios operacionais. "
+                        "Para bloquear 09:00–10:45, adicione o bloqueio na seção acima antes de executar."
+                    )
 
                 # Se já havia simulação de atraso na aba Resultados, reseta para o novo resultado.
                 for key in ("alloc_base", "alloc_current", "delay_events", "_active_solution_id"):
