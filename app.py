@@ -646,23 +646,37 @@ with tab_config:
         tow_thr = col_a3.number_input(
             "Limiar longa permanência (min)", min_value=60, max_value=360, value=180)
 
+        st.markdown("---")
+        operational_block_spacing_minutes = st.number_input(
+            "Espaçamento entre movimentos ajustados após restrição de pista (min)",
+            min_value=1,
+            max_value=30,
+            value=5,
+            step=1,
+            key="operational_block_spacing_minutes",
+            help=(
+                "Quando múltiplos voos são empurrados para depois do fim do bloqueio, "
+                "este intervalo separa os horários ajustados para evitar conflitos."
+            ),
+        )
+
     st.divider()
-    st.subheader("Bloqueios operacionais")
-    st.caption(
-        "Durante estes intervalos, chegadas e partidas são empurradas para depois do fim do bloqueio antes do Gurobi."
+    st.subheader("Restrição de janela de tempo – Pista")
+    st.markdown(
+        """
+        Defina intervalos em que o aeroporto **não permitirá novos pousos nem decolagens**.
+
+        - **Avião já em solo:** permanece normalmente e só pode partir após o fim do bloqueio.
+          _Exemplo: avião chegou às 9h com partida às 11h e bloqueio das 10h às 12h → permanece até as 12h._
+        - **Avião que chegaria durante o bloqueio:** fica em sobrevoo e pousa ao final do intervalo.
+          _Exemplo: avião que chegaria às 11h com bloqueio das 10h às 12h → pousa às 12h._
+
+        Deixe sem bloqueios para rodar a otimização sem restrição de horário na pista.
+        """
     )
 
     if "operational_blocks_ui" not in st.session_state:
         st.session_state["operational_blocks_ui"] = []
-
-    operational_block_spacing_minutes = st.number_input(
-        "Espaçamento entre movimentos ajustados (min)",
-        min_value=1,
-        max_value=30,
-        value=5,
-        step=1,
-        key="operational_block_spacing_minutes",
-    )
 
     # Datas reais existentes no planejamento. O erro mais comum era adicionar o
     # bloqueio na data de hoje, enquanto o voo exibido era de outra data
@@ -689,53 +703,60 @@ with tab_config:
     with st.form("operational_block_form", clear_on_submit=True):
         c_b1, c_b2, c_b3, c_b4 = st.columns([1.2, 1, 1, 2])
 
-        if _flight_dates_for_blocks:
-            block_date = c_b1.selectbox(
-                "Data do bloqueio",
-                options=_flight_dates_for_blocks,
-                format_func=lambda d: d.strftime("%d/%m/%Y"),
-                key="block_date_select",
-            )
-        else:
-            block_date = c_b1.date_input("Data do bloqueio", value=dt.date.today(), key="block_date")
+        _default_date = _flight_dates_for_blocks[0] if _flight_dates_for_blocks else dt.date.today()
+        block_date = c_b1.date_input(
+            "Data do bloqueio",
+            value=_default_date,
+            format="DD/MM/YYYY",
+            key="block_date",
+        )
 
         block_start = c_b2.time_input("Início", value=dt.time(9, 0), key="block_start")
         block_end = c_b3.time_input("Fim", value=dt.time(10, 45), key="block_end")
         block_reason = c_b4.text_input("Motivo", value="", key="block_reason")
 
-        if st.form_submit_button("Adicionar bloqueio"):
-            block_item = {
-                "date": block_date.isoformat(),
-                "start_time": block_start.strftime("%H:%M"),
-                "end_time": block_end.strftime("%H:%M"),
-                "reason": str(block_reason).strip(),
-            }
-            st.session_state["operational_blocks_ui"].append(block_item)
-            st.success(
-                "Bloqueio adicionado para "
-                f"{block_date.strftime('%d/%m/%Y')} das "
-                f"{block_start.strftime('%H:%M')} às {block_end.strftime('%H:%M')}."
-            )
+        if st.form_submit_button("Adicionar restrição"):
+            if block_end <= block_start:
+                st.error("O horário de fim deve ser posterior ao horário de início.")
+            else:
+                block_item = {
+                    "date": block_date.isoformat(),
+                    "start_time": block_start.strftime("%H:%M"),
+                    "end_time": block_end.strftime("%H:%M"),
+                    "reason": str(block_reason).strip(),
+                }
+                st.session_state["operational_blocks_ui"].append(block_item)
+                if _flight_dates_for_blocks and block_date not in _flight_dates_for_blocks:
+                    st.warning(
+                        f"Atenção: {block_date.strftime('%d/%m/%Y')} não possui voos no planejamento. "
+                        f"Verifique se a data está correta. "
+                        f"Datas disponíveis: {', '.join(d.strftime('%d/%m/%Y') for d in _flight_dates_for_blocks[:5])}."
+                    )
+                else:
+                    st.success(
+                        f"Restrição adicionada: {block_date.strftime('%d/%m/%Y')} "
+                        f"das {block_start.strftime('%H:%M')} às {block_end.strftime('%H:%M')}."
+                    )
 
     blocks_now = list(st.session_state.get("operational_blocks_ui") or [])
     if blocks_now:
-        st.dataframe(
-            pd.DataFrame(blocks_now).rename(
-                columns={
-                    "date": "Data",
-                    "start_time": "Início",
-                    "end_time": "Fim",
-                    "reason": "Motivo",
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-        if st.button("Limpar bloqueios operacionais"):
+        for i, blk in enumerate(blocks_now):
+            data_fmt = pd.to_datetime(blk["date"]).strftime("%d/%m/%Y")
+            with st.container(border=True):
+                col_info, col_btn = st.columns([9, 1])
+                motivo = f"\n_{blk['reason']}_" if blk.get("reason") else ""
+                col_info.markdown(
+                    f"**{data_fmt}** &nbsp;·&nbsp; {blk['start_time']} – {blk['end_time']}{motivo}"
+                )
+                if col_btn.button("🗑", key=f"rm_block_{i}", help="Remover esta restrição"):
+                    st.session_state["operational_blocks_ui"].pop(i)
+                    st.rerun()
+
+        if st.button("Remover todas as restrições", type="secondary"):
             st.session_state["operational_blocks_ui"] = []
             st.rerun()
     else:
-        st.info("Nenhum bloqueio operacional configurado.")
+        st.info("Nenhuma restrição de pista configurada. A otimização será executada sem restrição de horário.")
 
     st.divider()
 
@@ -747,7 +768,7 @@ with tab_config:
         st.warning(
             "Faça upload de voos.csv, posicoes.csv e categoriaaeronaves.csv para continuar.")
 
-    if st.button("▶ Executar Otimização", disabled=not ready, type="primary", use_container_width=True):
+    if st.button("▶ Executar Otimização", disabled=not ready, type="primary", width='stretch'):
 
         config = ModelConfig(
             objective=objective,
@@ -832,17 +853,15 @@ with tab_config:
 
                 if config.operational_blocks:
                     st.info(
-                        "Bloqueios aplicados nesta otimização: "
+                        "Restrições de pista aplicadas: "
                         + "; ".join(
                             f"{b.get('date')} {b.get('start_time')}–{b.get('end_time')}"
+                            + (f" ({b.get('reason')})" if b.get('reason') else "")
                             for b in config.operational_blocks
                         )
                     )
                 else:
-                    st.warning(
-                        "A otimização foi executada sem bloqueios operacionais. "
-                        "Para bloquear 09:00–10:45, adicione o bloqueio na seção acima antes de executar."
-                    )
+                    st.info("Otimização executada sem restrição de janela de tempo na pista.")
 
                 # Se já havia simulação de atraso na aba Resultados, reseta para o novo resultado.
                 for key in ("alloc_base", "alloc_current", "delay_events", "_active_solution_id"):
@@ -938,292 +957,294 @@ with tab_results:
 
     # ── Bloqueio de portão por manutenção ─────────────────────────────────
 
-    st.subheader("🔒 Bloqueio de portão por manutenção")
-    st.caption(
-        "Selecione um portão e marque-o como bloqueado para manutenção no dia selecionado. "
-        "Todos os voos já alocados nele serão realocados para o portão compatível mais próximo. "
-        "Voos atrasados também não poderão ser direcionados ao portão bloqueado."
-    )
+    with st.expander("Bloqueio de portão por manutenção", expanded=False):
 
-    # Inicializa conjunto de portões bloqueados no session_state
-    if "blocked_gates" not in st.session_state:
-        st.session_state["blocked_gates"] = {}  # {"YYYY-MM-DD": ["stand_id", ...]}
+        st.caption(
+            "Selecione um portão e marque-o como bloqueado para manutenção no dia selecionado. "
+            "Todos os voos já alocados nele serão realocados para o portão compatível mais próximo. "
+            "Voos atrasados também não poderão ser direcionados ao portão bloqueado."
+        )
 
-    _date_key = selected_date.isoformat()
-    _blocked_today = st.session_state["blocked_gates"].get(_date_key, [])
+        # Inicializa conjunto de portões bloqueados no session_state
+        if "blocked_gates" not in st.session_state:
+            st.session_state["blocked_gates"] = {}  # {"YYYY-MM-DD": ["stand_id", ...]}
 
-    _all_stands_day = sorted(
-        alloc_day["stand_id"].astype(str).unique().tolist(), key=stand_sort_key
-    ) if not alloc_day.empty else []
+        _date_key = selected_date.isoformat()
+        _blocked_today = st.session_state["blocked_gates"].get(_date_key, [])
 
-    _available_to_block = [s for s in _all_stands_day if s not in _blocked_today]
+        _all_stands_day = sorted(
+            alloc_day["stand_id"].astype(str).unique().tolist(), key=stand_sort_key
+        ) if not alloc_day.empty else []
 
-    _col_b1, _col_b2 = st.columns([3, 1])
-    _stand_to_block = _col_b1.selectbox(
-        "Portão para bloquear",
-        options=_available_to_block if _available_to_block else [""],
-        key=f"block_stand_{_date_key}",
-        disabled=not _available_to_block,
-    )
-    _do_block = _col_b2.button(
-        "🔒 Bloquear portão",
-        type="primary",
-        use_container_width=True,
-        key=f"do_block_{_date_key}",
-        disabled=not _available_to_block or not _stand_to_block,
-    )
+        _available_to_block = [s for s in _all_stands_day if s not in _blocked_today]
 
-    # Carrega posições/adjacência para uso no bloqueio e na simulação de atraso
-    _input_paths_ui = st.session_state.get("input_paths") or {}
-    _pos_path_ui = _input_paths_ui.get("positions") or str(BASE_DIR / "posicoes.csv")
-    if Path(_pos_path_ui).exists():
-        _positions_norm_ui, _adjacency_ui = load_positions_context(str(_pos_path_ui))
-    else:
-        _positions_norm_ui, _adjacency_ui = None, {}
+        _col_b1, _col_b2 = st.columns([3, 1])
+        _stand_to_block = _col_b1.selectbox(
+            "Portão para bloquear",
+            options=_available_to_block if _available_to_block else [""],
+            key=f"block_stand_{_date_key}",
+            disabled=not _available_to_block,
+        )
+        _col_b2.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        _do_block = _col_b2.button(
+            "🔒 Bloquear portão",
+            type="primary",
+            width='stretch',
+            key=f"do_block_{_date_key}",
+            disabled=not _available_to_block or not _stand_to_block,
+        )
 
-    if _do_block and _stand_to_block:
-        try:
-            if _positions_norm_ui is None:
-                st.error("Arquivo posicoes.csv não encontrado. Não é possível realocar.")
-            else:
-                _bsummary = apply_gate_block(
-                    alloc=alloc,
-                    blocked_stand=_stand_to_block,
-                    block_date=selected_date,
-                    positions=_positions_norm_ui,
-                    adjacency=_adjacency_ui,
-                    config=ModelConfig(),
-                )
-                # Registra portão bloqueado
-                _blocked_today_new = list(_blocked_today) + [str(_stand_to_block)]
-                st.session_state["blocked_gates"][_date_key] = _blocked_today_new
+        # Carrega posições/adjacência para uso no bloqueio e na simulação de atraso
+        _input_paths_ui = st.session_state.get("input_paths") or {}
+        _pos_path_ui = _input_paths_ui.get("positions") or str(BASE_DIR / "posicoes.csv")
+        if Path(_pos_path_ui).exists():
+            _positions_norm_ui, _adjacency_ui = load_positions_context(str(_pos_path_ui))
+        else:
+            _positions_norm_ui, _adjacency_ui = None, {}
 
-                _moved = _bsummary.get("moved_ops", [])
-                if _moved:
-                    _parts = []
-                    for _item in _moved:
-                        _ot = OPERATION_LABELS.get(str(_item.get("operation_type", "")), str(_item.get("operation_type", "")))
-                        _parts.append(f"{_ot}: {_item.get('stand_from')}→{_item.get('stand_to')}")
-                    st.success(
-                        f"Portão **{_stand_to_block}** bloqueado para manutenção. "
-                        f"{_bsummary['total']} operação(ões) realocada(s): {'; '.join(_parts)}."
-                    )
+        if _do_block and _stand_to_block:
+            try:
+                if _positions_norm_ui is None:
+                    st.error("Arquivo posicoes.csv não encontrado. Não é possível realocar.")
                 else:
-                    st.success(
-                        f"Portão **{_stand_to_block}** bloqueado. Nenhuma operação precisou ser realocada."
+                    _bsummary = apply_gate_block(
+                        alloc=alloc,
+                        blocked_stand=_stand_to_block,
+                        block_date=selected_date,
+                        positions=_positions_norm_ui,
+                        adjacency=_adjacency_ui,
+                        config=ModelConfig(),
                     )
-        except Exception as _be:
-            st.error(f"Erro ao bloquear portão: {_be}")
+                    # Registra portão bloqueado
+                    _blocked_today_new = list(_blocked_today) + [str(_stand_to_block)]
+                    st.session_state["blocked_gates"][_date_key] = _blocked_today_new
 
-    # Exibe portões já bloqueados no dia
-    _blocked_now = st.session_state["blocked_gates"].get(_date_key, [])
-    if _blocked_now:
-        st.markdown(
-            f"**Portões bloqueados hoje ({selected_date.strftime('%d/%m/%Y')}):** "
-            + ", ".join([f"🔒 {s}" for s in _blocked_now])
-        )
-        _col_ub1, _ = st.columns([2, 4])
-        _unblock_stand = _col_ub1.selectbox(
-            "Desbloquear portão",
-            options=[""] + _blocked_now,
-            key=f"unblock_stand_{_date_key}",
-        )
-        if _unblock_stand:
-            if st.button(
-                f"🔓 Desbloquear {_unblock_stand}",
-                key=f"do_unblock_{_date_key}_{_unblock_stand}",
-            ):
-                _new_list = [s for s in _blocked_now if s != _unblock_stand]
-                st.session_state["blocked_gates"][_date_key] = _new_list
-                st.info(f"Portão {_unblock_stand} desbloqueado. As realocações anteriores permanecem ativas; reotimize se necessário.")
-                st.rerun()
+                    _moved = _bsummary.get("moved_ops", [])
+                    if _moved:
+                        _parts = []
+                        for _item in _moved:
+                            _ot = OPERATION_LABELS.get(str(_item.get("operation_type", "")), str(_item.get("operation_type", "")))
+                            _parts.append(f"{_ot}: {_item.get('stand_from')}→{_item.get('stand_to')}")
+                        st.success(
+                            f"Portão **{_stand_to_block}** bloqueado para manutenção. "
+                            f"{_bsummary['total']} operação(ões) realocada(s): {'; '.join(_parts)}."
+                        )
+                    else:
+                        st.success(
+                            f"Portão **{_stand_to_block}** bloqueado. Nenhuma operação precisou ser realocada."
+                        )
+            except Exception as _be:
+                st.error(f"Erro ao bloquear portão: {_be}")
 
-    st.divider()
+        # Exibe portões já bloqueados no dia
+        _blocked_now = st.session_state["blocked_gates"].get(_date_key, [])
+        if _blocked_now:
+            st.markdown(
+                f"**Portões bloqueados hoje ({selected_date.strftime('%d/%m/%Y')}):** "
+                + ", ".join([f"🔒 {s}" for s in _blocked_now])
+            )
+            _col_ub1, _ = st.columns([2, 4])
+            _unblock_stand = _col_ub1.selectbox(
+                "Desbloquear portão",
+                options=[""] + _blocked_now,
+                key=f"unblock_stand_{_date_key}",
+            )
+            if _unblock_stand:
+                if st.button(
+                    f"🔓 Desbloquear {_unblock_stand}",
+                    key=f"do_unblock_{_date_key}_{_unblock_stand}",
+                ):
+                    _new_list = [s for s in _blocked_now if s != _unblock_stand]
+                    st.session_state["blocked_gates"][_date_key] = _new_list
+                    st.info(f"Portão {_unblock_stand} desbloqueado. As realocações anteriores permanecem ativas; reotimize se necessário.")
+                    st.rerun()
 
     # ── Simulação de atraso (somente lista do dia) ─────────────────────────
 
-    st.subheader("Simular atraso")
-    st.caption(
-        "Atraso aplicado na partida (estende a permanência em solo). "
-        "Se houver conflito de portão, o voo é realocado automaticamente para um portão compatível disponível."
-    )
+    with st.expander("Simular atraso", expanded=False):
 
-    input_paths = st.session_state.get("input_paths") or {}
-    positions_path = input_paths.get("positions") or str(BASE_DIR / "posicoes.csv")
-    flights_path = input_paths.get("flights") or str(BASE_DIR / "voos.csv")
-
-    positions_ok = Path(positions_path).exists()
-    if not positions_ok:
-        st.warning(
-            "Não foi possível carregar o arquivo de posições (posicoes.csv). "
-            "A simulação de atraso/realocação depende dele."
-        )
-    elif alloc_day.empty:
-        st.info("Nenhuma operação no dia selecionado.")
-    else:
-        base_cfg = ModelConfig()
-        positions_norm, adjacency = load_positions_context(str(positions_path))
-
-        flights_by_id = pd.DataFrame()
-        if Path(flights_path).exists():
-            try:
-                flights_by_id = load_flights_by_movement_id(str(flights_path))
-            except Exception:
-                flights_by_id = pd.DataFrame()
-
-        visit_ids_day = sorted(alloc_day["visit_id"].astype(str).unique().tolist())
-        visit_flights = build_visit_flight_lookup(visit_ids_day, flights_by_id)
-
-        gate_rows = alloc_day[
-            alloc_day["operation_type"].astype(str).str.strip().str.lower().isin(["turnaround", "departure"])
-        ]
-        gate_by_visit = (
-            gate_rows.sort_values("start_time")
-            .groupby("visit_id")["stand_id"]
-            .first()
-            .astype(str)
-            .to_dict()
+        st.caption(
+            "Atraso aplicado na partida (estende a permanência em solo). "
+            "Se houver conflito de portão, o voo é realocado automaticamente para um portão compatível disponível."
         )
 
-        visits_day = (
-            alloc_day.groupby("visit_id")
-            .agg(
-                company=("company", "first"),
-                aircraft_category=("aircraft_category", "first"),
-                visit_start=("start_time", "min"),
-                visit_end=("end_time", "max"),
+        input_paths = st.session_state.get("input_paths") or {}
+        positions_path = input_paths.get("positions") or str(BASE_DIR / "posicoes.csv")
+        flights_path = input_paths.get("flights") or str(BASE_DIR / "voos.csv")
+
+        positions_ok = Path(positions_path).exists()
+        if not positions_ok:
+            st.warning(
+                "Não foi possível carregar o arquivo de posições (posicoes.csv). "
+                "A simulação de atraso/realocação depende dele."
             )
-            .reset_index()
-            .sort_values("visit_start")
-            .reset_index(drop=True)
-        )
-        visits_day["gate_stand"] = visits_day["visit_id"].map(gate_by_visit).fillna("")
-        visits_day["dep_flight"] = visits_day["visit_id"].map(
-            lambda vid: visit_flights.get(str(vid), {}).get("departure_flight_number", "")
-        )
-        visits_day["arr_flight"] = visits_day["visit_id"].map(
-            lambda vid: visit_flights.get(str(vid), {}).get("arrival_flight_number", "")
-        )
+        elif alloc_day.empty:
+            st.info("Nenhuma operação no dia selecionado.")
+        else:
+            base_cfg = ModelConfig()
+            positions_norm, adjacency = load_positions_context(str(positions_path))
 
-        visit_labels: dict[str, str] = {}
-        for _, r in visits_day.iterrows():
-            vid = str(r["visit_id"])
-            dep = str(r.get("dep_flight") or "").strip()
-            arr = str(r.get("arr_flight") or "").strip()
-            comp = str(r.get("company") or "").strip()
-            stand = str(r.get("gate_stand") or "").strip()
-            start = r.get("visit_start")
-            end = r.get("visit_end")
+            flights_by_id = pd.DataFrame()
+            if Path(flights_path).exists():
+                try:
+                    flights_by_id = load_flights_by_movement_id(str(flights_path))
+                except Exception:
+                    flights_by_id = pd.DataFrame()
 
-            flight_part = vid
-            if arr and dep:
-                flight_part = f"{comp} · {arr}→{dep}"
-            elif dep:
-                flight_part = f"{comp} · DEP {dep}"
-            elif comp:
-                flight_part = f"{comp} · {vid}"
+            visit_ids_day = sorted(alloc_day["visit_id"].astype(str).unique().tolist())
+            visit_flights = build_visit_flight_lookup(visit_ids_day, flights_by_id)
 
-            if pd.notna(start) and pd.notna(end):
-                time_part = f"{pd.to_datetime(start).strftime('%H:%M')}–{pd.to_datetime(end).strftime('%H:%M')}"
-            else:
-                time_part = ""
+            gate_rows = alloc_day[
+                alloc_day["operation_type"].astype(str).str.strip().str.lower().isin(["turnaround", "departure"])
+            ]
+            gate_by_visit = (
+                gate_rows.sort_values("start_time")
+                .groupby("visit_id")["stand_id"]
+                .first()
+                .astype(str)
+                .to_dict()
+            )
 
-            stand_part = f"Portão {stand}" if stand else ""
-            extra = " · ".join([p for p in [time_part, stand_part, vid] if p])
-            visit_labels[vid] = f"{flight_part} · {extra}" if extra else flight_part
-
-        col_d1, col_d2, col_d3 = st.columns([3, 1, 1])
-        selected_visit_id = col_d1.selectbox(
-            "Voo/visita (somente do dia)",
-            options=visits_day["visit_id"].astype(str).tolist(),
-            format_func=lambda vid: visit_labels.get(str(vid), str(vid)),
-            key=f"delay_visit_{selected_date.isoformat()}",
-        )
-        delay_minutes = col_d2.number_input(
-            "Atraso (min)",
-            min_value=0,
-            max_value=600,
-            value=15,
-            step=5,
-            key=f"delay_minutes_{selected_date.isoformat()}",
-        )
-        apply_delay = col_d3.button(
-            "Aplicar atraso",
-            type="primary",
-            use_container_width=True,
-            key=f"apply_delay_{selected_date.isoformat()}",
-        )
-
-        if apply_delay:
-            try:
-                _blocked_for_delay = st.session_state.get("blocked_gates", {}).get(selected_date.isoformat(), [])
-                summary = apply_departure_delay_and_reassign(
-                    alloc=alloc,
-                    visit_id=str(selected_visit_id),
-                    delay_minutes=int(delay_minutes),
-                    positions=positions_norm,
-                    adjacency=adjacency,
-                    config=base_cfg,
-                    blocked_stands=_blocked_for_delay if _blocked_for_delay else None,
+            visits_day = (
+                alloc_day.groupby("visit_id")
+                .agg(
+                    company=("company", "first"),
+                    aircraft_category=("aircraft_category", "first"),
+                    visit_start=("start_time", "min"),
+                    visit_end=("end_time", "max"),
                 )
+                .reset_index()
+                .sort_values("visit_start")
+                .reset_index(drop=True)
+            )
+            visits_day["gate_stand"] = visits_day["visit_id"].map(gate_by_visit).fillna("")
+            visits_day["dep_flight"] = visits_day["visit_id"].map(
+                lambda vid: visit_flights.get(str(vid), {}).get("departure_flight_number", "")
+            )
+            visits_day["arr_flight"] = visits_day["visit_id"].map(
+                lambda vid: visit_flights.get(str(vid), {}).get("arrival_flight_number", "")
+            )
 
-                moved = summary.get("moved_ops", []) or []
-                moved_summary = ""
-                if moved:
-                    parts = []
-                    for item in moved:
-                        op_t = str(item.get("operation_type", "")).strip()
-                        op_t = OPERATION_LABELS.get(op_t, op_t)
-                        parts.append(f"{op_t}: {item.get('stand_from')}→{item.get('stand_to')}")
-                    moved_summary = "; ".join(parts)
+            visit_labels: dict[str, str] = {}
+            for _, r in visits_day.iterrows():
+                vid = str(r["visit_id"])
+                dep = str(r.get("dep_flight") or "").strip()
+                arr = str(r.get("arr_flight") or "").strip()
+                comp = str(r.get("company") or "").strip()
+                stand = str(r.get("gate_stand") or "").strip()
+                start = r.get("visit_start")
+                end = r.get("visit_end")
 
-                dep_flight = visit_flights.get(str(selected_visit_id), {}).get("departure_flight_number", "")
-                company = (
-                    alloc.loc[alloc["visit_id"].astype(str) == str(selected_visit_id), "company"].astype(str).head(1).tolist()
-                    or [""]
-                )[0]
+                flight_part = vid
+                if arr and dep:
+                    flight_part = f"{comp} · {arr}→{dep}"
+                elif dep:
+                    flight_part = f"{comp} · DEP {dep}"
+                elif comp:
+                    flight_part = f"{comp} · {vid}"
 
-                st.session_state.setdefault("delay_events", []).append(
-                    {
-                        "date": selected_date.isoformat(),
-                        "visit_id": str(selected_visit_id),
-                        "company": str(company),
-                        "departure_flight": str(dep_flight),
-                        "delay_minutes": int(delay_minutes),
-                        "moved": moved_summary,
-                    }
-                )
-
-                if moved_summary:
-                    st.success(f"Atraso aplicado. Realocação: {moved_summary}.")
+                if pd.notna(start) and pd.notna(end):
+                    time_part = f"{pd.to_datetime(start).strftime('%H:%M')}–{pd.to_datetime(end).strftime('%H:%M')}"
                 else:
-                    st.success("Atraso aplicado. Nenhuma realocação foi necessária.")
+                    time_part = ""
 
-            except Exception as e:
-                st.error(f"Não foi possível aplicar o atraso: {e}")
+                stand_part = f"Portão {stand}" if stand else ""
+                extra = " · ".join([p for p in [time_part, stand_part, vid] if p])
+                visit_labels[vid] = f"{flight_part} · {extra}" if extra else flight_part
 
-        # Recarrega a fatia do dia após possíveis mudanças.
-        alloc_day = alloc[alloc["start_time"].dt.date == selected_date].copy()
-
-        events_day = [
-            e for e in (st.session_state.get("delay_events") or [])
-            if str(e.get("date")) == selected_date.isoformat()
-        ]
-        if events_day:
-            st.markdown("**Voos com atraso (dia selecionado)**")
-            events_table = pd.DataFrame(
-                [
-                    {
-                        "Voo (partida)": e.get("departure_flight", ""),
-                        "Empresa": e.get("company", ""),
-                        "Visita": e.get("visit_id", ""),
-                        "Atraso (min)": e.get("delay_minutes", 0),
-                        "Realocação": e.get("moved", ""),
-                    }
-                    for e in events_day
-                ]
+            col_d1, col_d2, col_d3 = st.columns([3, 1, 1])
+            selected_visit_id = col_d1.selectbox(
+                "Voo/visita (somente do dia)",
+                options=visits_day["visit_id"].astype(str).tolist(),
+                format_func=lambda vid: visit_labels.get(str(vid), str(vid)),
+                key=f"delay_visit_{selected_date.isoformat()}",
             )
-            st.dataframe(events_table, use_container_width=True, hide_index=True)
+            delay_minutes = col_d2.number_input(
+                "Atraso (min)",
+                min_value=0,
+                max_value=600,
+                value=15,
+                step=5,
+                key=f"delay_minutes_{selected_date.isoformat()}",
+            )
+            col_d3.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            apply_delay = col_d3.button(
+                "Aplicar atraso",
+                type="primary",
+                width='stretch',
+                key=f"apply_delay_{selected_date.isoformat()}",
+            )
+
+            if apply_delay:
+                try:
+                    _blocked_for_delay = st.session_state.get("blocked_gates", {}).get(selected_date.isoformat(), [])
+                    summary = apply_departure_delay_and_reassign(
+                        alloc=alloc,
+                        visit_id=str(selected_visit_id),
+                        delay_minutes=int(delay_minutes),
+                        positions=positions_norm,
+                        adjacency=adjacency,
+                        config=base_cfg,
+                        blocked_stands=_blocked_for_delay if _blocked_for_delay else None,
+                    )
+
+                    moved = summary.get("moved_ops", []) or []
+                    moved_summary = ""
+                    if moved:
+                        parts = []
+                        for item in moved:
+                            op_t = str(item.get("operation_type", "")).strip()
+                            op_t = OPERATION_LABELS.get(op_t, op_t)
+                            parts.append(f"{op_t}: {item.get('stand_from')}→{item.get('stand_to')}")
+                        moved_summary = "; ".join(parts)
+
+                    dep_flight = visit_flights.get(str(selected_visit_id), {}).get("departure_flight_number", "")
+                    company = (
+                        alloc.loc[alloc["visit_id"].astype(str) == str(selected_visit_id), "company"].astype(str).head(1).tolist()
+                        or [""]
+                    )[0]
+
+                    st.session_state.setdefault("delay_events", []).append(
+                        {
+                            "date": selected_date.isoformat(),
+                            "visit_id": str(selected_visit_id),
+                            "company": str(company),
+                            "departure_flight": str(dep_flight),
+                            "delay_minutes": int(delay_minutes),
+                            "moved": moved_summary,
+                        }
+                    )
+
+                    if moved_summary:
+                        st.success(f"Atraso aplicado. Realocação: {moved_summary}.")
+                    else:
+                        st.success("Atraso aplicado. Nenhuma realocação foi necessária.")
+
+                except Exception as e:
+                    st.error(f"Não foi possível aplicar o atraso: {e}")
+
+            # Recarrega a fatia do dia após possíveis mudanças.
+            alloc_day = alloc[alloc["start_time"].dt.date == selected_date].copy()
+
+            events_day = [
+                e for e in (st.session_state.get("delay_events") or [])
+                if str(e.get("date")) == selected_date.isoformat()
+            ]
+            if events_day:
+                st.markdown("**Voos com atraso (dia selecionado)**")
+                events_table = pd.DataFrame(
+                    [
+                        {
+                            "Voo (partida)": e.get("departure_flight", ""),
+                            "Empresa": e.get("company", ""),
+                            "Visita": e.get("visit_id", ""),
+                            "Atraso (min)": e.get("delay_minutes", 0),
+                            "Realocação": e.get("moved", ""),
+                        }
+                        for e in events_day
+                    ]
+                )
+                st.dataframe(events_table, width='stretch', hide_index=True)
 
     # ── Reboques (recalculado a partir da alocação atual) ─────────────────
 
@@ -1362,7 +1383,7 @@ with tab_results:
     st.markdown("**Funções objetivo**")
     objective_table = build_objective_table(daily)
     objective_table["Valor"] = objective_table["Valor"].map(format_int_pt)
-    st.dataframe(objective_table, use_container_width=True, hide_index=True)
+    st.dataframe(objective_table, width='stretch', hide_index=True)
 
     st.divider()
 
@@ -1396,6 +1417,38 @@ with tab_results:
         (df["start_time"].dt.hour < h_end + 1) &
         (df["end_time"].dt.hour >= h_start)
     ]
+
+    # Corta as barras nas fronteiras dos bloqueios para que a zona de restrição
+    # apareça visualmente vazia no Gantt (aviões que chegaram antes do bloqueio
+    # são exibidos em dois segmentos: antes e depois da zona).
+    _gantt_blocks = [
+        b for b in (st.session_state.get("operational_blocks") or [])
+        if pd.to_datetime(b.get("date")).date() == selected_date
+    ]
+    if _gantt_blocks and not df.empty:
+        split_rows = []
+        for _, row in df.iterrows():
+            segments = [(row["start_time"], row["end_time"])]
+            for _blk in _gantt_blocks:
+                _bs = pd.Timestamp(f"{_blk['date']} {_blk['start_time']}")
+                _be = pd.Timestamp(f"{_blk['date']} {_blk['end_time']}")
+                new_segs = []
+                for s, e in segments:
+                    if e <= _bs or s >= _be:
+                        new_segs.append((s, e))
+                    else:
+                        if s < _bs:
+                            new_segs.append((s, _bs))
+                        if e > _be:
+                            new_segs.append((_be, e))
+                segments = new_segs
+            for s, e in segments:
+                if e > s:
+                    r = row.copy()
+                    r["start_time"] = s
+                    r["end_time"] = e
+                    split_rows.append(r)
+        df = pd.DataFrame(split_rows).reset_index(drop=True) if split_rows else df.iloc[0:0]
 
     if df.empty:
         st.info("Nenhuma operação para os filtros selecionados.")
@@ -1499,7 +1552,32 @@ with tab_results:
             if border_colors:
                 trace.marker.line.color = border_colors
                 trace.marker.line.width = 3
-        st.plotly_chart(fig_gantt, use_container_width=True)
+
+        # Overlay das restrições de pista sobre o Gantt
+        for _blk in (st.session_state.get("operational_blocks") or []):
+            try:
+                _blk_date = pd.to_datetime(_blk.get("date")).date()
+                if _blk_date != selected_date:
+                    continue
+                _blk_start = pd.Timestamp(f"{_blk['date']} {_blk['start_time']}")
+                _blk_end   = pd.Timestamp(f"{_blk['date']} {_blk['end_time']}")
+                _label = _blk.get("reason") or "Restrição de pista"
+                fig_gantt.add_vrect(
+                    x0=_blk_start,
+                    x1=_blk_end,
+                    fillcolor="rgba(220,50,50,0.10)",
+                    layer="below",
+                    line_width=1,
+                    line_color="rgba(220,50,50,0.45)",
+                    annotation_text=_label,
+                    annotation_position="top left",
+                    annotation_font_size=11,
+                    annotation_font_color="rgba(180,30,30,0.9)",
+                )
+            except Exception:
+                pass
+
+        st.plotly_chart(fig_gantt, width='stretch')
 
     # ── Lista de voos por portão (dia) ─────────────────────────────────────
 
@@ -1562,7 +1640,7 @@ with tab_results:
             .reset_index(drop=True)
         )
 
-        st.dataframe(table, use_container_width=True, height=320)
+        st.dataframe(table, width='stretch', height=320)
 
     st.divider()
 
@@ -1582,7 +1660,7 @@ with tab_results:
         )
         fig.update_traces(textposition="inside", textinfo="percent+label")
         fig.update_layout(showlegend=False, margin=dict(t=10, b=10))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     with col_b:
         st.markdown("**Operações por categoria de aeronave**")
@@ -1597,7 +1675,7 @@ with tab_results:
         fig.update_traces(textposition="outside")
         fig.update_layout(showlegend=False, margin=dict(
             t=10, b=10), xaxis_title="", yaxis_title="")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     with col_c:
         st.markdown("**Estacionamento de longa permanência por tipo**")
@@ -1611,7 +1689,7 @@ with tab_results:
         fig.update_traces(textposition="outside")
         fig.update_layout(showlegend=False, margin=dict(
             t=10, b=10), xaxis_title="", yaxis_title="")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     st.divider()
 
@@ -1638,7 +1716,7 @@ with tab_results:
         legend_title="Tipo de posição",
         margin=dict(t=10, b=40),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     st.divider()
 
@@ -1673,7 +1751,7 @@ with tab_results:
                 "visit_id", "operation_id", "successor_operation_id",
                 "stand_origem", "stand_destino", "aircraft_category", "horario",
             ]].reset_index(drop=True),
-            use_container_width=True,
+            width='stretch',
             height=300,
         )
 
@@ -1688,7 +1766,7 @@ with tab_results:
         data=alloc.to_csv(index=False).encode("utf-8"),
         file_name="alocacao_resultado.csv",
         mime="text/csv",
-        use_container_width=True,
+        width='stretch',
     )
     if not tows.empty:
         d2.download_button(
@@ -1696,5 +1774,5 @@ with tab_results:
             data=tows.to_csv(index=False).encode("utf-8"),
             file_name="reboques_resultado.csv",
             mime="text/csv",
-            use_container_width=True,
+            width='stretch',
         )
