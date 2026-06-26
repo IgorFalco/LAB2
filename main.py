@@ -348,6 +348,19 @@ def apply_operational_blocks_to_visits(
         if dep <= arr:
             dep = arr + spacing
 
+        # 3) Para longa permanência: garante que o início da operação de embarque
+        # (dep - embark_minutes) também não caia dentro de um bloqueio.
+        # Sem isso, o embarque começaria dentro do bloco mesmo com a decolagem correta.
+        adjusted_ground_min = (dep - arr).total_seconds() / 60
+        if adjusted_ground_min > config.tow_threshold_minutes:
+            embark_td = pd.Timedelta(minutes=config.embark_minutes)
+            while True:
+                dep_op_start = dep - embark_td
+                blk = containing_block(dep_op_start)
+                if blk is None:
+                    break
+                dep = blk[1] + embark_td + spacing
+
         df.at[idx, "arrival_time"] = arr
         df.at[idx, "departure_time"] = dep
 
