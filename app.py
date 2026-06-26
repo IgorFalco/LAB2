@@ -646,23 +646,37 @@ with tab_config:
         tow_thr = col_a3.number_input(
             "Limiar longa permanência (min)", min_value=60, max_value=360, value=180)
 
+        st.markdown("---")
+        operational_block_spacing_minutes = st.number_input(
+            "Espaçamento entre movimentos ajustados após restrição de pista (min)",
+            min_value=1,
+            max_value=30,
+            value=5,
+            step=1,
+            key="operational_block_spacing_minutes",
+            help=(
+                "Quando múltiplos voos são empurrados para depois do fim do bloqueio, "
+                "este intervalo separa os horários ajustados para evitar conflitos."
+            ),
+        )
+
     st.divider()
-    st.subheader("Bloqueios operacionais")
-    st.caption(
-        "Durante estes intervalos, chegadas e partidas são empurradas para depois do fim do bloqueio antes do Gurobi."
+    st.subheader("Restrição de janela de tempo – Pista")
+    st.markdown(
+        """
+        Defina intervalos em que o aeroporto **não permitirá novos pousos nem decolagens**.
+
+        - **Avião já em solo:** permanece normalmente e só pode partir após o fim do bloqueio.
+          _Exemplo: avião chegou às 9h com partida às 11h e bloqueio das 10h às 12h → permanece até as 12h._
+        - **Avião que chegaria durante o bloqueio:** fica em sobrevoo e pousa ao final do intervalo.
+          _Exemplo: avião que chegaria às 11h com bloqueio das 10h às 12h → pousa às 12h._
+
+        Deixe sem bloqueios para rodar a otimização sem restrição de horário na pista.
+        """
     )
 
     if "operational_blocks_ui" not in st.session_state:
         st.session_state["operational_blocks_ui"] = []
-
-    operational_block_spacing_minutes = st.number_input(
-        "Espaçamento entre movimentos ajustados (min)",
-        min_value=1,
-        max_value=30,
-        value=5,
-        step=1,
-        key="operational_block_spacing_minutes",
-    )
 
     # Datas reais existentes no planejamento. O erro mais comum era adicionar o
     # bloqueio na data de hoje, enquanto o voo exibido era de outra data
@@ -703,19 +717,21 @@ with tab_config:
         block_end = c_b3.time_input("Fim", value=dt.time(10, 45), key="block_end")
         block_reason = c_b4.text_input("Motivo", value="", key="block_reason")
 
-        if st.form_submit_button("Adicionar bloqueio"):
-            block_item = {
-                "date": block_date.isoformat(),
-                "start_time": block_start.strftime("%H:%M"),
-                "end_time": block_end.strftime("%H:%M"),
-                "reason": str(block_reason).strip(),
-            }
-            st.session_state["operational_blocks_ui"].append(block_item)
-            st.success(
-                "Bloqueio adicionado para "
-                f"{block_date.strftime('%d/%m/%Y')} das "
-                f"{block_start.strftime('%H:%M')} às {block_end.strftime('%H:%M')}."
-            )
+        if st.form_submit_button("Adicionar restrição"):
+            if block_end <= block_start:
+                st.error("O horário de fim deve ser posterior ao horário de início.")
+            else:
+                block_item = {
+                    "date": block_date.isoformat(),
+                    "start_time": block_start.strftime("%H:%M"),
+                    "end_time": block_end.strftime("%H:%M"),
+                    "reason": str(block_reason).strip(),
+                }
+                st.session_state["operational_blocks_ui"].append(block_item)
+                st.success(
+                    f"Restrição adicionada: {block_date.strftime('%d/%m/%Y')} "
+                    f"das {block_start.strftime('%H:%M')} às {block_end.strftime('%H:%M')}."
+                )
 
     blocks_now = list(st.session_state.get("operational_blocks_ui") or [])
     if blocks_now:
@@ -731,11 +747,11 @@ with tab_config:
             use_container_width=True,
             hide_index=True,
         )
-        if st.button("Limpar bloqueios operacionais"):
+        if st.button("Remover todas as restrições"):
             st.session_state["operational_blocks_ui"] = []
             st.rerun()
     else:
-        st.info("Nenhum bloqueio operacional configurado.")
+        st.info("Nenhuma restrição de pista configurada. A otimização será executada sem restrição de horário.")
 
     st.divider()
 
@@ -832,17 +848,15 @@ with tab_config:
 
                 if config.operational_blocks:
                     st.info(
-                        "Bloqueios aplicados nesta otimização: "
+                        "Restrições de pista aplicadas: "
                         + "; ".join(
                             f"{b.get('date')} {b.get('start_time')}–{b.get('end_time')}"
+                            + (f" ({b.get('reason')})" if b.get('reason') else "")
                             for b in config.operational_blocks
                         )
                     )
                 else:
-                    st.warning(
-                        "A otimização foi executada sem bloqueios operacionais. "
-                        "Para bloquear 09:00–10:45, adicione o bloqueio na seção acima antes de executar."
-                    )
+                    st.info("Otimização executada sem restrição de janela de tempo na pista.")
 
                 # Se já havia simulação de atraso na aba Resultados, reseta para o novo resultado.
                 for key in ("alloc_base", "alloc_current", "delay_events", "_active_solution_id"):
