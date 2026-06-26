@@ -985,6 +985,7 @@ with tab_results:
             key=f"block_stand_{_date_key}",
             disabled=not _available_to_block,
         )
+        _col_b2.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
         _do_block = _col_b2.button(
             "🔒 Bloquear portão",
             type="primary",
@@ -1166,6 +1167,7 @@ with tab_results:
                 step=5,
                 key=f"delay_minutes_{selected_date.isoformat()}",
             )
+            col_d3.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
             apply_delay = col_d3.button(
                 "Aplicar atraso",
                 type="primary",
